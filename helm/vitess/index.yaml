@@ -2,9 +2,9 @@ apiVersion: v1
 entries:
   vitess:
   - apiVersion: v1
-    created: "2020-04-15T17:16:49.790287+05:30"
+    created: "2020-04-15T17:26:17.621763+05:30"
     description: Single-Chart Vitess Cluster
-    digest: 57af4d4a9003919d10f141cfdac1b849420945a07365336c099bf2c537662633
+    digest: 0ff5d4fe4fad35b18583499fe36b29db981f64085b5e6bcc010408254288f9d2
     home: https://vitess.io
     icon: https://vitess.io/img/logos/vitess.png
     keywords:
@@ -23,6 +23,6 @@ entries:
     sources:
     - https://github.com/vitessio/vitess
     urls:
-    - vitess/vitess-2.0.0-0.tgz
+    - vitess-2.0.0-0.tgz
     version: 2.0.0-0
-generated: "2020-04-15T17:16:49.785162+05:30"
+generated: "2020-04-15T17:26:17.62047+05:30"
