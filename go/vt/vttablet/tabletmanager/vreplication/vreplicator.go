@@ -17,11 +17,16 @@ limitations under the License.
 package vreplication
 
 import (
+	"flag"
 	"fmt"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -36,12 +41,30 @@ var (
 	// idleTimeout is set to slightly above 1s, compared to heartbeatTime
 	// set by VStreamer at slightly below 1s. This minimizes conflicts
 	// between the two timeouts.
-	idleTimeout         = 1100 * time.Millisecond
-	dbLockRetryDelay    = 1 * time.Second
-	relayLogMaxSize     = 30000
-	relayLogMaxItems    = 1000
-	copyTimeout         = 1 * time.Hour
-	replicaLagTolerance = 10 * time.Second
+	idleTimeout = 1100 * time.Millisecond
+
+	dbLockRetryDelay = 1 * time.Second
+	relayLogMaxSize  = flag.Int("relay_log_max_size", 250000, "Maximum buffer size (in bytes) for VReplication target buffering. If single rows are larger than this, a single row is buffered at a time.")
+	relayLogMaxItems = flag.Int("relay_log_max_items", 5000, "Maximum number of rows for VReplication target buffering.")
+
+	copyPhaseDuration   = flag.Duration("vreplication_copy_phase_duration", 1*time.Hour, "Duration for each copy phase loop (before running the next catchup: default 1h)")
+	replicaLagTolerance = flag.Duration("vreplication_replica_lag_tolerance", 1*time.Minute, "Replica lag threshold duration: once lag is below this we switch from copy phase to the replication (streaming) phase")
+
+	// vreplicationHeartbeatUpdateInterval determines how often the time_updated column is updated if there are no real events on the source and the source
+	// vstream is only sending heartbeats for this long. Keep this low if you expect high QPS and are monitoring this column to alert about potential
+	// outages. Keep this high if
+	// 		you have too many streams the extra write qps or cpu load due to these updates are unacceptable
+	//		you have too many streams and/or a large source field (lot of participating tables) which generates unacceptable increase in your binlog size
+	vreplicationHeartbeatUpdateInterval = flag.Int("vreplication_heartbeat_update_interval", 1, "Frequency (in seconds, default 1, max 60) at which the time_updated column of a vreplication stream when idling")
+	// vreplicationMinimumHeartbeatUpdateInterval overrides vreplicationHeartbeatUpdateInterval if the latter is higher than this
+	// to ensure that it satisfies liveness criteria implicitly expected by internal processes like Online DDL
+	vreplicationMinimumHeartbeatUpdateInterval = 60
+
+	vreplicationExperimentalFlags = flag.Int64("vreplication_experimental_flags", 0x01, "(Bitmask) of experimental features in vreplication to enable")
+
+	vreplicationExperimentalFlagOptimizeInserts int64 = 1
+
+	vreplicationStoreCompressedGTID = flag.Bool("vreplication_store_compressed_gtid", false, "Store compressed gtids in the pos column of _vt.vreplication")
 )
 
 // vreplicator provides the core logic to start vreplication streams
@@ -52,11 +75,13 @@ type vreplicator struct {
 	// source
 	source          *binlogdatapb.BinlogSource
 	sourceVStreamer VStreamerClient
-
-	stats *binlogplayer.Stats
+	state           string
+	stats           *binlogplayer.Stats
 	// mysqld is used to fetch the local schema.
-	mysqld    mysqlctl.MysqlDaemon
-	tableKeys map[string][]string
+	mysqld     mysqlctl.MysqlDaemon
+	colInfoMap map[string][]*ColumnInfo
+
+	originalFKCheckSetting int64
 }
 
 // newVReplicator creates a new vreplicator. The valid fields from the source are:
@@ -71,8 +96,9 @@ type vreplicator struct {
 //   "select * from t where in_keyrange(col1, 'hash', '-80')",
 //   "select col1, col2 from t where...",
 //   "select col1, keyspace_id() as ksid from t where...",
-//   "select id, count(*), sum(price) from t group by id".
-//   Only "in_keyrange" expressions are supported in the where clause.
+//   "select id, count(*), sum(price) from t group by id",
+//   "select * from t where customer_id=1 and val = 'newton'".
+//   Only "in_keyrange" expressions, integer and string comparisons are supported in the where clause.
 //   The select expressions can be any valid non-aggregate expressions,
 //   or count(*), or sum(col).
 //   If the target column name does not match the source expression, an
@@ -80,6 +106,10 @@ type vreplicator struct {
 //   More advanced constructs can be used. Please see the table plan builder
 //   documentation for more info.
 func newVReplicator(id uint32, source *binlogdatapb.BinlogSource, sourceVStreamer VStreamerClient, stats *binlogplayer.Stats, dbClient binlogplayer.DBClient, mysqld mysqlctl.MysqlDaemon, vre *Engine) *vreplicator {
+	if *vreplicationHeartbeatUpdateInterval > vreplicationMinimumHeartbeatUpdateInterval {
+		log.Warningf("the supplied value for vreplication_heartbeat_update_interval:%d seconds is larger than the maximum allowed:%d seconds, vreplication will fallback to %d",
+			*vreplicationHeartbeatUpdateInterval, vreplicationMinimumHeartbeatUpdateInterval, vreplicationMinimumHeartbeatUpdateInterval)
+	}
 	return &vreplicator{
 		vre:             vre,
 		id:              id,
@@ -115,7 +145,8 @@ func newVReplicator(id uint32, source *binlogdatapb.BinlogSource, sourceVStreame
 func (vr *vreplicator) Replicate(ctx context.Context) error {
 	err := vr.replicate(ctx)
 	if err != nil {
-		if err := vr.setMessage(err.Error()); err != nil {
+		log.Errorf("Replicate error: %s", err.Error())
+		if err := vr.setMessage(fmt.Sprintf("Error: %s", err.Error())); err != nil {
 			log.Errorf("Failed to set error state: %v", err)
 		}
 	}
@@ -123,13 +154,22 @@ func (vr *vreplicator) Replicate(ctx context.Context) error {
 }
 
 func (vr *vreplicator) replicate(ctx context.Context) error {
-	tableKeys, err := vr.buildTableKeys()
+	colInfo, err := vr.buildColInfoMap(ctx)
 	if err != nil {
 		return err
 	}
-	vr.tableKeys = tableKeys
-
+	vr.colInfoMap = colInfo
+	if err := vr.getSettingFKCheck(); err != nil {
+		return err
+	}
+	//defensive guard, should be a no-op since it should happen after copy is done
+	defer vr.resetFKCheckAfterCopy()
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		// This rollback is a no-op. It's here for safety
 		// in case the functions below leave transactions open.
 		vr.dbClient.Rollback()
@@ -145,39 +185,130 @@ func (vr *vreplicator) replicate(ctx context.Context) error {
 
 		switch {
 		case numTablesToCopy != 0:
-			if err := newVCopier(vr).copyNext(ctx, settings); err != nil {
+			if err := vr.clearFKCheck(); err != nil {
+				log.Warningf("Unable to clear FK check %v", err)
 				return err
+			}
+			if err := newVCopier(vr).copyNext(ctx, settings); err != nil {
+				vr.stats.ErrorCounts.Add([]string{"Copy"}, 1)
+				return err
+			}
+			settings, numTablesToCopy, err = vr.readSettings(ctx)
+			if err != nil {
+				return err
+			}
+			if numTablesToCopy == 0 {
+				if err := vr.insertLog(LogCopyEnd, fmt.Sprintf("Copy phase completed at gtid %s", settings.StartPos)); err != nil {
+					return err
+				}
 			}
 		case settings.StartPos.IsZero():
 			if err := newVCopier(vr).initTablesForCopy(ctx); err != nil {
+				vr.stats.ErrorCounts.Add([]string{"Copy"}, 1)
 				return err
 			}
 		default:
+			if err := vr.resetFKCheckAfterCopy(); err != nil {
+				log.Warningf("Unable to reset FK check %v", err)
+				return err
+			}
 			if vr.source.StopAfterCopy {
 				return vr.setState(binlogplayer.BlpStopped, "Stopped after copy.")
 			}
 			if err := vr.setState(binlogplayer.BlpRunning, ""); err != nil {
+				vr.stats.ErrorCounts.Add([]string{"Replicate"}, 1)
 				return err
 			}
-			return newVPlayer(vr, settings, nil, mysql.Position{}).play(ctx)
+			return newVPlayer(vr, settings, nil, mysql.Position{}, "replicate").play(ctx)
 		}
 	}
 }
 
-func (vr *vreplicator) buildTableKeys() (map[string][]string, error) {
-	schema, err := vr.mysqld.GetSchema(vr.dbClient.DBName(), []string{"/.*/"}, nil, false)
+// ColumnInfo is used to store charset and collation
+type ColumnInfo struct {
+	Name        string
+	CharSet     string
+	Collation   string
+	DataType    string
+	ColumnType  string
+	IsPK        bool
+	IsGenerated bool
+}
+
+func (vr *vreplicator) buildColInfoMap(ctx context.Context) (map[string][]*ColumnInfo, error) {
+	schema, err := vr.mysqld.GetSchema(ctx, vr.dbClient.DBName(), []string{"/.*/"}, nil, false)
 	if err != nil {
 		return nil, err
 	}
-	tableKeys := make(map[string][]string)
+	queryTemplate := "select character_set_name, collation_name, column_name, data_type, column_type, extra from information_schema.columns where table_schema=%s and table_name=%s;"
+	colInfoMap := make(map[string][]*ColumnInfo)
 	for _, td := range schema.TableDefinitions {
-		if len(td.PrimaryKeyColumns) != 0 {
-			tableKeys[td.Name] = td.PrimaryKeyColumns
-		} else {
-			tableKeys[td.Name] = td.Columns
+
+		query := fmt.Sprintf(queryTemplate, encodeString(vr.dbClient.DBName()), encodeString(td.Name))
+		qr, err := vr.mysqld.FetchSuperQuery(ctx, query)
+		if err != nil {
+			return nil, err
 		}
+		if len(qr.Rows) == 0 {
+			return nil, fmt.Errorf("no data returned from information_schema.columns")
+		}
+
+		var pks []string
+		if len(td.PrimaryKeyColumns) != 0 {
+			pks = td.PrimaryKeyColumns
+		} else {
+			pks = td.Columns
+		}
+		var colInfo []*ColumnInfo
+		for _, row := range qr.Rows {
+			charSet := ""
+			collation := ""
+			columnName := ""
+			isPK := false
+			isGenerated := false
+			var dataType, columnType string
+			columnName = row[2].ToString()
+			var currentField *querypb.Field
+			for _, field := range td.Fields {
+				if field.Name == columnName {
+					currentField = field
+					break
+				}
+			}
+			if currentField == nil {
+				continue
+			}
+			dataType = row[3].ToString()
+			columnType = row[4].ToString()
+			if sqltypes.IsText(currentField.Type) {
+				charSet = row[0].ToString()
+				collation = row[1].ToString()
+			}
+			if dataType == "" || columnType == "" {
+				return nil, fmt.Errorf("no dataType/columnType found in information_schema.columns for table %s, column %s", td.Name, columnName)
+			}
+			for _, pk := range pks {
+				if columnName == pk {
+					isPK = true
+				}
+			}
+			extra := strings.ToLower(row[5].ToString())
+			if strings.Contains(extra, "generated") || strings.Contains(extra, "virtual") {
+				isGenerated = true
+			}
+			colInfo = append(colInfo, &ColumnInfo{
+				Name:        columnName,
+				CharSet:     charSet,
+				Collation:   collation,
+				DataType:    dataType,
+				ColumnType:  columnType,
+				IsPK:        isPK,
+				IsGenerated: isGenerated,
+			})
+		}
+		colInfoMap[td.Name] = colInfo
 	}
-	return tableKeys, nil
+	return colInfoMap, nil
 }
 
 func (vr *vreplicator) readSettings(ctx context.Context) (settings binlogplayer.VRSettings, numTablesToCopy int64, err error) {
@@ -187,28 +318,14 @@ func (vr *vreplicator) readSettings(ctx context.Context) (settings binlogplayer.
 	}
 
 	query := fmt.Sprintf("select count(*) from _vt.copy_state where vrepl_id=%d", vr.id)
-	qr, err := vr.dbClient.Execute(query)
+	qr, err := withDDL.Exec(ctx, query, vr.dbClient.ExecuteFetch)
 	if err != nil {
-		// If it's a not found error, create it.
-		merr, isSQLErr := err.(*mysql.SQLError)
-		if !isSQLErr || !(merr.Num == mysql.ERNoSuchTable || merr.Num == mysql.ERBadDb) {
-			return settings, numTablesToCopy, err
-		}
-		log.Info("Looks like _vt.copy_state table may not exist. Trying to create... ")
-		if _, merr := vr.dbClient.Execute(createCopyState); merr != nil {
-			log.Errorf("Failed to ensure _vt.copy_state table exists: %v", merr)
-			return settings, numTablesToCopy, err
-		}
-		// Redo the read.
-		qr, err = vr.dbClient.Execute(query)
-		if err != nil {
-			return settings, numTablesToCopy, err
-		}
+		return settings, numTablesToCopy, err
 	}
 	if len(qr.Rows) == 0 || len(qr.Rows[0]) == 0 {
 		return settings, numTablesToCopy, fmt.Errorf("unexpected result from %s: %v", query, qr)
 	}
-	numTablesToCopy, err = sqltypes.ToInt64(qr.Rows[0][0])
+	numTablesToCopy, err = evalengine.ToInt64(qr.Rows[0][0])
 	if err != nil {
 		return settings, numTablesToCopy, err
 	}
@@ -224,7 +341,14 @@ func (vr *vreplicator) setMessage(message string) error {
 	if _, err := vr.dbClient.Execute(query); err != nil {
 		return fmt.Errorf("could not set message: %v: %v", query, err)
 	}
+	if err := insertLog(vr.dbClient, LogMessage, vr.id, vr.state, message); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (vr *vreplicator) insertLog(typ, message string) error {
+	return insertLog(vr.dbClient, typ, vr.id, vr.state, message)
 }
 
 func (vr *vreplicator) setState(state, message string) error {
@@ -239,6 +363,14 @@ func (vr *vreplicator) setState(state, message string) error {
 	if _, err := vr.dbClient.ExecuteFetch(query, 1); err != nil {
 		return fmt.Errorf("could not set state: %v: %v", query, err)
 	}
+	if state == vr.state {
+		return nil
+	}
+	if err := insertLog(vr.dbClient, LogStateChange, vr.id, state, message); err != nil {
+		return err
+	}
+	vr.state = state
+
 	return nil
 }
 
@@ -246,4 +378,29 @@ func encodeString(in string) string {
 	var buf strings.Builder
 	sqltypes.NewVarChar(in).EncodeSQL(&buf)
 	return buf.String()
+}
+
+func (vr *vreplicator) getSettingFKCheck() error {
+	qr, err := vr.dbClient.Execute("select @@foreign_key_checks;")
+	if err != nil {
+		return err
+	}
+	if len(qr.Rows) != 1 || len(qr.Fields) != 1 {
+		return fmt.Errorf("unable to select @@foreign_key_checks")
+	}
+	vr.originalFKCheckSetting, err = evalengine.ToInt64(qr.Rows[0][0])
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (vr *vreplicator) resetFKCheckAfterCopy() error {
+	_, err := vr.dbClient.Execute(fmt.Sprintf("set foreign_key_checks=%d;", vr.originalFKCheckSetting))
+	return err
+}
+
+func (vr *vreplicator) clearFKCheck() error {
+	_, err := vr.dbClient.Execute("set foreign_key_checks=0;")
+	return err
 }

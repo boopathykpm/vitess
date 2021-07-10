@@ -19,8 +19,9 @@ package etcd2topo
 import (
 	"errors"
 
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	"golang.org/x/net/context"
+	"context"
+
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 

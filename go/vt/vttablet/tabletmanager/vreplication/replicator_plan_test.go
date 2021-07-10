@@ -21,7 +21,10 @@ import (
 	"strings"
 	"testing"
 
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
+
 	"github.com/stretchr/testify/assert"
+
 	"vitess.io/vitess/go/sqltypes"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
@@ -666,8 +669,8 @@ func TestBuildPlayerPlan(t *testing.T) {
 		err: "group by expression is not allowed to reference an aggregate expression: a",
 	}}
 
-	tableKeys := map[string][]string{
-		"t1": {"c1"},
+	PrimaryKeyInfos := map[string][]*ColumnInfo{
+		"t1": {&ColumnInfo{Name: "c1", IsPK: true}},
 	}
 
 	copyState := map[string]*sqltypes.Result{
@@ -681,7 +684,7 @@ func TestBuildPlayerPlan(t *testing.T) {
 	}
 
 	for _, tcase := range testcases {
-		plan, err := buildReplicatorPlan(tcase.input, tableKeys, nil)
+		plan, err := buildReplicatorPlan(tcase.input, PrimaryKeyInfos, nil, binlogplayer.NewStats())
 		gotPlan, _ := json.Marshal(plan)
 		wantPlan, _ := json.Marshal(tcase.plan)
 		if string(gotPlan) != string(wantPlan) {
@@ -695,7 +698,7 @@ func TestBuildPlayerPlan(t *testing.T) {
 			t.Errorf("Filter err(%v): %s, want %v", tcase.input, gotErr, tcase.err)
 		}
 
-		plan, err = buildReplicatorPlan(tcase.input, tableKeys, copyState)
+		plan, err = buildReplicatorPlan(tcase.input, PrimaryKeyInfos, copyState, binlogplayer.NewStats())
 		if err != nil {
 			continue
 		}
@@ -708,9 +711,9 @@ func TestBuildPlayerPlan(t *testing.T) {
 }
 
 func TestBuildPlayerPlanNoDup(t *testing.T) {
-	tableKeys := map[string][]string{
-		"t1": {"c1"},
-		"t2": {"c2"},
+	PrimaryKeyInfos := map[string][]*ColumnInfo{
+		"t1": {&ColumnInfo{Name: "c1"}},
+		"t2": {&ColumnInfo{Name: "c2"}},
 	}
 	input := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
@@ -721,7 +724,7 @@ func TestBuildPlayerPlanNoDup(t *testing.T) {
 			Filter: "select * from t",
 		}},
 	}
-	_, err := buildReplicatorPlan(input, tableKeys, nil)
+	_, err := buildReplicatorPlan(input, PrimaryKeyInfos, nil, binlogplayer.NewStats())
 	want := "more than one target for source table t"
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("buildReplicatorPlan err: %v, must contain: %v", err, want)
@@ -729,9 +732,9 @@ func TestBuildPlayerPlanNoDup(t *testing.T) {
 }
 
 func TestBuildPlayerPlanExclude(t *testing.T) {
-	tableKeys := map[string][]string{
-		"t1": {"c1"},
-		"t2": {"c2"},
+	PrimaryKeyInfos := map[string][]*ColumnInfo{
+		"t1": {&ColumnInfo{Name: "c1"}},
+		"t2": {&ColumnInfo{Name: "c2"}},
 	}
 	input := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
@@ -742,7 +745,7 @@ func TestBuildPlayerPlanExclude(t *testing.T) {
 			Filter: "",
 		}},
 	}
-	plan, err := buildReplicatorPlan(input, tableKeys, nil)
+	plan, err := buildReplicatorPlan(input, PrimaryKeyInfos, nil, binlogplayer.NewStats())
 	assert.NoError(t, err)
 
 	want := &TestReplicatorPlan{

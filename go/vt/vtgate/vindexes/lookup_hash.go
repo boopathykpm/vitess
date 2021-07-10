@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -108,7 +110,15 @@ func (lh *LookupHash) Map(vcursor VCursor, ids []sqltypes.Value) ([]key.Destinat
 		return out, nil
 	}
 
-	results, err := lh.lkp.Lookup(vcursor, ids)
+	// if ignore_nulls is set and the query is about single null value, then fallback to all shards
+	if len(ids) == 1 && ids[0].IsNull() && lh.lkp.IgnoreNulls {
+		for range ids {
+			out = append(out, key.DestinationKeyRange{KeyRange: &topodatapb.KeyRange{}})
+		}
+		return out, nil
+	}
+
+	results, err := lh.lkp.Lookup(vcursor, ids, vtgatepb.CommitOrder_NORMAL)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +129,7 @@ func (lh *LookupHash) Map(vcursor VCursor, ids []sqltypes.Value) ([]key.Destinat
 		}
 		ksids := make([][]byte, 0, len(result.Rows))
 		for _, row := range result.Rows {
-			num, err := sqltypes.ToUint64(row[0])
+			num, err := evalengine.ToUint64(row[0])
 			if err != nil {
 				// A failure to convert is equivalent to not being
 				// able to map.
@@ -264,7 +274,7 @@ func (lhu *LookupHashUnique) Map(vcursor VCursor, ids []sqltypes.Value) ([]key.D
 		return out, nil
 	}
 
-	results, err := lhu.lkp.Lookup(vcursor, ids)
+	results, err := lhu.lkp.Lookup(vcursor, ids, vtgatepb.CommitOrder_NORMAL)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +283,7 @@ func (lhu *LookupHashUnique) Map(vcursor VCursor, ids []sqltypes.Value) ([]key.D
 		case 0:
 			out = append(out, key.DestinationNone{})
 		case 1:
-			num, err := sqltypes.ToUint64(result.Rows[0][0])
+			num, err := evalengine.ToUint64(result.Rows[0][0])
 			if err != nil {
 				out = append(out, key.DestinationNone{})
 				continue

@@ -22,15 +22,15 @@ import (
 	"fmt"
 	"strings"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/proto/vtgate"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
@@ -91,7 +91,15 @@ func (lu *ConsistentLookup) Map(vcursor VCursor, ids []sqltypes.Value) ([]key.De
 		return out, nil
 	}
 
-	results, err := lu.lkp.Lookup(vcursor, ids)
+	// if ignore_nulls is set and the query is about single null value, then fallback to all shards
+	if len(ids) == 1 && ids[0].IsNull() && lu.lkp.IgnoreNulls {
+		for range ids {
+			out = append(out, key.DestinationKeyRange{KeyRange: &topodatapb.KeyRange{}})
+		}
+		return out, nil
+	}
+
+	results, err := lu.lkp.Lookup(vcursor, ids, vtgatepb.CommitOrder_PRE)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +164,7 @@ func (lu *ConsistentLookupUnique) Map(vcursor VCursor, ids []sqltypes.Value) ([]
 		return out, nil
 	}
 
-	results, err := lu.lkp.Lookup(vcursor, ids)
+	results, err := lu.lkp.Lookup(vcursor, ids, vcursor.LookupRowLockShardSession())
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +217,7 @@ func newCLCommon(name string, m map[string]string) (*clCommon, error) {
 
 func (lu *clCommon) SetOwnerInfo(keyspace, table string, cols []sqlparser.ColIdent) error {
 	lu.keyspace = keyspace
-	lu.ownerTable = table
+	lu.ownerTable = sqlparser.String(sqlparser.NewTableIdent(table))
 	if len(cols) != len(lu.lkp.FromColumns) {
 		return fmt.Errorf("owner table column count does not match vindex %s", lu.name)
 	}
@@ -243,22 +251,22 @@ func (lu *clCommon) Verify(vcursor VCursor, ids []sqltypes.Value, ksids [][]byte
 
 // Create reserves the id by inserting it into the vindex table.
 func (lu *clCommon) Create(vcursor VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte, ignoreMode bool) error {
-	err := lu.lkp.createCustom(vcursor, rowsColValues, ksidsToValues(ksids), ignoreMode, vtgatepb.CommitOrder_PRE)
-	if err == nil {
+	origErr := lu.lkp.createCustom(vcursor, rowsColValues, ksidsToValues(ksids), ignoreMode, vtgatepb.CommitOrder_PRE)
+	if origErr == nil {
 		return nil
 	}
-	if !strings.Contains(err.Error(), "Duplicate entry") {
-		return err
+	if !strings.Contains(origErr.Error(), "Duplicate entry") {
+		return origErr
 	}
 	for i, row := range rowsColValues {
-		if err := lu.handleDup(vcursor, row, ksids[i]); err != nil {
+		if err := lu.handleDup(vcursor, row, ksids[i], origErr); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (lu *clCommon) handleDup(vcursor VCursor, values []sqltypes.Value, ksid []byte) error {
+func (lu *clCommon) handleDup(vcursor VCursor, values []sqltypes.Value, ksid []byte, dupError error) error {
 	bindVars := make(map[string]*querypb.BindVariable, len(values))
 	for colnum, val := range values {
 		bindVars[lu.lkp.FromColumns[colnum]] = sqltypes.ValueBindVariable(val)
@@ -283,7 +291,7 @@ func (lu *clCommon) handleDup(vcursor VCursor, values []sqltypes.Value, ksid []b
 			return err
 		}
 		if len(qr.Rows) >= 1 {
-			return vterrors.Errorf(vtrpcpb.Code_ALREADY_EXISTS, "duplicate entry %v", values)
+			return dupError
 		}
 		if bytes.Equal(existingksid, ksid) {
 			return nil
@@ -306,7 +314,7 @@ func (lu *clCommon) Delete(vcursor VCursor, rowsColValues [][]sqltypes.Value, ks
 func (lu *clCommon) Update(vcursor VCursor, oldValues []sqltypes.Value, ksid []byte, newValues []sqltypes.Value) error {
 	equal := true
 	for i := range oldValues {
-		result, err := sqltypes.NullsafeCompare(oldValues[i], newValues[i])
+		result, err := evalengine.NullsafeCompare(oldValues[i], newValues[i])
 		// errors from NullsafeCompare can be ignored. if they are real problems, we'll see them in the Create/Update
 		if err != nil || result != 0 {
 			equal = false

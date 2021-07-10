@@ -17,19 +17,25 @@ limitations under the License.
 package vtgate
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+
 	"vitess.io/vitess/go/trace"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/tlstest"
 )
 
 type testHandler struct {
@@ -43,14 +49,11 @@ func (th *testHandler) NewConnection(c *mysql.Conn) {
 func (th *testHandler) ConnectionClosed(c *mysql.Conn) {
 }
 
-func (th *testHandler) ComInitDB(c *mysql.Conn, schemaName string) {
-}
-
 func (th *testHandler) ComQuery(c *mysql.Conn, q string, callback func(*sqltypes.Result) error) error {
 	return nil
 }
 
-func (th *testHandler) ComPrepare(c *mysql.Conn, q string) ([]*querypb.Field, error) {
+func (th *testHandler) ComPrepare(c *mysql.Conn, q string, b map[string]*querypb.BindVariable) ([]*querypb.Field, error) {
 	return nil, nil
 }
 
@@ -169,6 +172,12 @@ func newFromStringFail(t *testing.T) func(ctx context.Context, parentSpan string
 	}
 }
 
+func newFromStringError(t *testing.T) func(ctx context.Context, parentSpan string, label string) (trace.Span, context.Context, error) {
+	return func(ctx context.Context, parentSpan string, label string) (trace.Span, context.Context, error) {
+		return trace.NoopSpan{}, context.Background(), fmt.Errorf("")
+	}
+}
+
 func newFromStringExpect(t *testing.T, expected string) func(ctx context.Context, parentSpan string, label string) (trace.Span, context.Context, error) {
 	return func(ctx context.Context, parentSpan string, label string) (trace.Span, context.Context, error) {
 		assert.Equal(t, expected, parentSpan)
@@ -205,6 +214,18 @@ func TestSpanContextPassedInEvenAroundOtherComments(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestSpanContextNotParsable(t *testing.T) {
+	hasRun := false
+	_, _, err := startSpanTestable(context.Background(), "/*VT_SPAN_CONTEXT=123*/SQL QUERY", "someLabel",
+		func(c context.Context, s string) (trace.Span, context.Context) {
+			hasRun = true
+			return trace.NoopSpan{}, context.Background()
+		},
+		newFromStringError(t))
+	assert.NoError(t, err)
+	assert.True(t, hasRun, "Should have continued execution despite failure to parse VT_SPAN_CONTEXT")
+}
+
 func newTestAuthServerStatic() *mysql.AuthServerStatic {
 	jsonConfig := "{\"user1\":{\"Password\":\"password1\", \"UserData\":\"userData1\", \"SourceHost\":\"localhost\"}}"
 	return mysql.NewAuthServerStatic("", jsonConfig, 0)
@@ -213,8 +234,8 @@ func newTestAuthServerStatic() *mysql.AuthServerStatic {
 func TestDefaultWorkloadEmpty(t *testing.T) {
 	vh := &vtgateHandler{}
 	sess := vh.session(&mysql.Conn{})
-	if sess.Options.Workload != querypb.ExecuteOptions_UNSPECIFIED {
-		t.Fatalf("Expected default workload UNSPECIFIED")
+	if sess.Options.Workload != querypb.ExecuteOptions_OLTP {
+		t.Fatalf("Expected default workload OLTP")
 	}
 }
 
@@ -224,5 +245,46 @@ func TestDefaultWorkloadOLAP(t *testing.T) {
 	sess := vh.session(&mysql.Conn{})
 	if sess.Options.Workload != querypb.ExecuteOptions_OLAP {
 		t.Fatalf("Expected default workload OLAP")
+	}
+}
+
+func TestInitTLSConfigWithoutServerCA(t *testing.T) {
+	testInitTLSConfig(t, false)
+}
+
+func TestInitTLSConfigWithServerCA(t *testing.T) {
+	testInitTLSConfig(t, true)
+}
+
+func testInitTLSConfig(t *testing.T, serverCA bool) {
+	// Create the certs.
+	root, err := ioutil.TempDir("", "TestInitTLSConfig")
+	if err != nil {
+		t.Fatalf("TempDir failed: %v", err)
+	}
+	defer os.RemoveAll(root)
+	tlstest.CreateCA(root)
+	tlstest.CreateSignedCert(root, tlstest.CA, "01", "server", "server.example.com")
+
+	serverCACert := ""
+	if serverCA {
+		serverCACert = path.Join(root, "ca-cert.pem")
+	}
+
+	listener := &mysql.Listener{}
+	if err := initTLSConfig(listener, path.Join(root, "server-cert.pem"), path.Join(root, "server-key.pem"), path.Join(root, "ca-cert.pem"), serverCACert, true); err != nil {
+		t.Fatalf("init tls config failure due to: +%v", err)
+	}
+
+	serverConfig := listener.TLSConfig.Load()
+	if serverConfig == nil {
+		t.Fatalf("init tls config shouldn't create nil server config")
+	}
+
+	sigChan <- syscall.SIGHUP
+	time.Sleep(100 * time.Millisecond) // wait for signal handler
+
+	if listener.TLSConfig.Load() == serverConfig {
+		t.Fatalf("init tls config should have been recreated after SIGHUP")
 	}
 }

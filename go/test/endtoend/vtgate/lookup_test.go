@@ -19,13 +19,13 @@ package vtgate
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/mysql"
-	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 )
 
@@ -43,12 +43,11 @@ func TestConsistentLookup(t *testing.T) {
 	// Simple insert.
 	exec(t, conn, "begin")
 	exec(t, conn, "insert into t1(id1, id2) values(1, 4)")
+	// check that the lookup query happens in the right connection
+	assertMatches(t, conn, "select * from t1 where id2 = 4", "[[INT64(1) INT64(4)]]")
 	exec(t, conn, "commit")
-	qr := exec(t, conn, "select * from t1")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(4)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select * from t1_id2_idx")
+	assertMatches(t, conn, "select * from t1", "[[INT64(1) INT64(4)]]")
+	qr := exec(t, conn, "select * from t1_id2_idx")
 	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(4) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
 		t.Errorf("select:\n%v want\n%v", got, want)
 	}
@@ -57,14 +56,16 @@ func TestConsistentLookup(t *testing.T) {
 	exec(t, conn, "begin")
 	_, err = conn.ExecuteFetch("insert into t1(id1, id2) values(1, 4)", 1000, false)
 	exec(t, conn, "rollback")
-	want := "duplicate entry"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("second insert: %v, must contain %s", err, want)
-	}
+	require.Error(t, err)
+	mysqlErr := err.(*mysql.SQLError)
+	assert.Equal(t, 1062, mysqlErr.Num)
+	assert.Equal(t, "23000", mysqlErr.State)
+	assert.Contains(t, mysqlErr.Message, "Duplicate entry")
 
 	// Simple delete.
 	exec(t, conn, "begin")
 	exec(t, conn, "delete from t1 where id1=1")
+	assertMatches(t, conn, "select * from t1 where id2 = 4", "[]")
 	exec(t, conn, "commit")
 	qr = exec(t, conn, "select * from t1")
 	if got, want := fmt.Sprintf("%v", qr.Rows), "[]"; got != want {
@@ -160,7 +161,7 @@ func TestConsistentLookup(t *testing.T) {
 	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(5) VARBINARY(\"\\x16k@\\xb4J\\xbaK\\xd6\")]]"; got != want {
 		t.Errorf("select:\n%v want\n%v", got, want)
 	}
-	exec(t, conn, "delete from t1 where id1=1")
+	exec(t, conn, "delete from t1 where id2=5")
 }
 
 func TestDMLScatter(t *testing.T) {
@@ -203,7 +204,7 @@ func TestDMLScatter(t *testing.T) {
 	3 4
 	4 5
 	*/
-	exec(t, conn, "update t3 set id5 = 42 where id5 = 1")
+	exec(t, conn, "update `ks[-]`.t3 set id5 = 42 where id5 = 1")
 	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5")
 	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(2) INT64(2) INT64(3)] [INT64(3) INT64(4) INT64(3)] [INT64(4) INT64(5) INT64(4)] [INT64(42) INT64(2) INT64(3)]]"; got != want {
 		t.Errorf("select:\n%v want\n%v", got, want)
@@ -246,7 +247,97 @@ func TestDMLScatter(t *testing.T) {
 	require.Empty(t, qr.Rows)
 
 	// delete all the rows.
-	exec(t, conn, "delete from t3")
+	exec(t, conn, "delete from `ks[-]`.t3")
+	qr = exec(t, conn, "select * from t3")
+	require.Empty(t, qr.Rows)
+	qr = exec(t, conn, "select * from t3_id7_idx")
+	require.Empty(t, qr.Rows)
+}
+
+func TestDMLIn(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	/* Simple insert. after this dml, the tables will contain the following:
+	t3 (id5, id6, id7):
+	1 2 3
+	2 2 3
+	3 4 3
+	4 5 4
+
+	t3_id7_idx (id7, keyspace_id:id6):
+	3 2
+	3 2
+	3 4
+	4 5
+	*/
+	exec(t, conn, "begin")
+	exec(t, conn, "insert into t3(id5, id6, id7) values(1, 2, 3), (2, 2, 3), (3, 4, 3), (4, 5, 4)")
+	exec(t, conn, "commit")
+	qr := exec(t, conn, "select id5, id6, id7 from t3 order by id5, id6")
+	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(3)] [INT64(2) INT64(2) INT64(3)] [INT64(3) INT64(4) INT64(3)] [INT64(4) INT64(5) INT64(4)]]"; got != want {
+		t.Errorf("select:\n%v want\n%v", got, want)
+	}
+
+	/* Updating a non lookup column. after this dml, the tables will contain the following:
+	t3 (id5, id6, id7):
+	1 2 3
+	2 2 3
+	42 4 3
+	42 5 4
+
+	t3_id7_idx (id7, keyspace_id:id6):
+	3 2
+	3 2
+	3 4
+	4 5
+	*/
+	exec(t, conn, "update t3 set id5 = 42 where id6 in (4, 5)")
+	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5, id6")
+	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(3)] [INT64(2) INT64(2) INT64(3)] [INT64(42) INT64(4) INT64(3)] [INT64(42) INT64(5) INT64(4)]]"; got != want {
+		t.Errorf("select:\n%v want\n%v", got, want)
+	}
+
+	/* Updating a non lookup column. after this dml, the tables will contain the following:
+	t3 (id5, id6, id7):
+	1 2 42
+	2 2 42
+	42 4 3
+	42 5 4
+
+	t3_id7_idx (id7, keyspace_id:id6):
+	42 2
+	42 2
+	3 4
+	42 5
+	*/
+	exec(t, conn, "begin")
+	exec(t, conn, "update t3 set id7 = 42 where id6 in (2, 5)")
+	exec(t, conn, "commit")
+	qr = exec(t, conn, "select id5, id6, id7 from t3 order by id5, id6")
+	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(1) INT64(2) INT64(42)] [INT64(2) INT64(2) INT64(42)] [INT64(42) INT64(4) INT64(3)] [INT64(42) INT64(5) INT64(42)]]"; got != want {
+		t.Errorf("select:\n%v want\n%v", got, want)
+	}
+
+	/* Updating a non lookup column. after this dml, the tables will contain the following:
+	t3 (id5, id6, id7):
+	42 4 3
+	42 5 4
+
+	t3_id7_idx (id7, keyspace_id:id6):
+	3 4
+	42 5
+	*/
+	exec(t, conn, "delete from t3 where id6 in (2)")
+	qr = exec(t, conn, "select * from t3 where id6 = 2")
+	require.Empty(t, qr.Rows)
+	qr = exec(t, conn, "select * from t3_id7_idx where id6 = 2")
+	require.Empty(t, qr.Rows)
+
+	// delete all the rows.
+	exec(t, conn, "delete from t3 where id6 in (4, 5)")
 	qr = exec(t, conn, "select * from t3")
 	require.Empty(t, qr.Rows)
 	qr = exec(t, conn, "select * from t3_id7_idx")
@@ -319,14 +410,8 @@ func TestHashLookupMultiInsertIgnore(t *testing.T) {
 	defer conn2.Close()
 
 	// DB should start out clean
-	qr := exec(t, conn, "select count(*) from t2_id4_idx")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(0)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select count(*) from t2")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(0)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	assertMatches(t, conn, "select count(*) from t2_id4_idx", "[[INT64(0)]]")
+	assertMatches(t, conn, "select count(*) from t2", "[[INT64(0)]]")
 
 	// Try inserting a bunch of ids at once
 	exec(t, conn, "begin")
@@ -334,14 +419,8 @@ func TestHashLookupMultiInsertIgnore(t *testing.T) {
 	exec(t, conn, "commit")
 
 	// Verify
-	qr = exec(t, conn, "select id3, id4 from t2 order by id3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(10) INT64(20)] [INT64(30) INT64(40)] [INT64(50) INT64(60)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
-	qr = exec(t, conn, "select id3, id4 from t2_id4_idx order by id3")
-	if got, want := fmt.Sprintf("%v", qr.Rows), "[[INT64(10) INT64(20)] [INT64(30) INT64(40)] [INT64(50) INT64(60)]]"; got != want {
-		t.Errorf("select:\n%v want\n%v", got, want)
-	}
+	assertMatches(t, conn, "select id3, id4 from t2 order by id3", "[[INT64(10) INT64(20)] [INT64(30) INT64(40)] [INT64(50) INT64(60)]]")
+	assertMatches(t, conn, "select id3, id4 from t2_id4_idx order by id3", "[[INT64(10) INT64(20)] [INT64(30) INT64(40)] [INT64(50) INT64(60)]]")
 }
 
 func TestConsistentLookupUpdate(t *testing.T) {
@@ -413,9 +492,38 @@ func TestConsistentLookupUpdate(t *testing.T) {
 	require.Empty(t, qr.Rows)
 }
 
-func exec(t *testing.T, conn *mysql.Conn, query string) *sqltypes.Result {
-	t.Helper()
-	qr, err := conn.ExecuteFetch(query, 1000, true)
-	require.Nil(t, err)
-	return qr
+func TestSelectNullLookup(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "insert into t6(id1, id2) values(1, 'a'), (2, 'b'), (3, null)")
+	defer exec(t, conn, "set workload = oltp;delete from t6")
+
+	for _, workload := range []string{"oltp", "olap"} {
+		t.Run(workload, func(t *testing.T) {
+			exec(t, conn, "set workload = "+workload)
+			assertMatches(t, conn, "select id1, id2 from t6 order by id1", "[[INT64(1) VARCHAR(\"a\")] [INT64(2) VARCHAR(\"b\")] [INT64(3) NULL]]")
+			assertIsEmpty(t, conn, "select id1, id2 from t6 where id2 = null")
+			assertMatches(t, conn, "select id1, id2 from t6 where id2 is null", "[[INT64(3) NULL]]")
+			assertMatches(t, conn, "select id1, id2 from t6 where id2 is not null order by id1", "[[INT64(1) VARCHAR(\"a\")] [INT64(2) VARCHAR(\"b\")]]")
+			assertIsEmpty(t, conn, "select id1, id2 from t6 where id1 IN (null)")
+			assertMatches(t, conn, "select id1, id2 from t6 where id1 IN (1,2,null) order by id1", "[[INT64(1) VARCHAR(\"a\")] [INT64(2) VARCHAR(\"b\")]]")
+			assertIsEmpty(t, conn, "select id1, id2 from t6 where id1 NOT IN (1,null) order by id1")
+			assertMatches(t, conn, "select id1, id2 from t6 where id1 NOT IN (1,3)", "[[INT64(2) VARCHAR(\"b\")]]")
+		})
+	}
+}
+
+func TestUnicodeLooseMD5CaseInsensitive(t *testing.T) {
+	ctx := context.Background()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	exec(t, conn, "insert into t4(id1, id2) values(1, 'test')")
+	defer exec(t, conn, "delete from t4")
+
+	assertMatches(t, conn, "SELECT id1, id2 from t4 where id2 = 'Test'", `[[INT64(1) VARCHAR("test")]]`)
 }

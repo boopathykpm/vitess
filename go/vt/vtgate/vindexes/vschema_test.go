@@ -23,7 +23,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -205,7 +206,7 @@ func TestUnshardedVSchema(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["unsharded"].Error
 	require.NoError(t, err)
 	ks := &Keyspace{
@@ -260,7 +261,7 @@ func TestVSchemaColumns(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["unsharded"].Error
 	require.NoError(t, err)
 	ks := &Keyspace{
@@ -325,8 +326,7 @@ func TestVSchemaColumnListAuthoritative(t *testing.T) {
 			},
 		},
 	}
-	got, err := BuildVSchema(&good)
-	require.NoError(t, err)
+	got := BuildVSchema(&good)
 	ks := &Keyspace{
 		Name: "unsharded",
 	}
@@ -388,7 +388,7 @@ func TestVSchemaColumnsFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	want := "duplicate column name 'c1' for table: t1"
 	err := got.Keyspaces["unsharded"].Error
 	if err == nil || err.Error() != want {
@@ -409,7 +409,7 @@ func TestVSchemaPinned(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["sharded"].Error
 	require.NoError(t, err)
 	ks := &Keyspace{
@@ -485,7 +485,7 @@ func TestShardedVSchemaOwned(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["sharded"].Error
 	require.NoError(t, err)
 	ks := &Keyspace{
@@ -613,7 +613,7 @@ func TestShardedVSchemaOwnerInfo(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["sharded"].Error
 	require.NoError(t, err)
 	results := []struct {
@@ -665,11 +665,17 @@ func TestVSchemaRoutingRules(t *testing.T) {
 				FromTable: "rt2",
 				ToTables:  []string{"ks2.t2"},
 			}, {
+				FromTable: "escaped",
+				ToTables:  []string{"`ks2`.`t2`"},
+			}, {
 				FromTable: "dup",
 				ToTables:  []string{"ks1.t1"},
 			}, {
 				FromTable: "dup",
 				ToTables:  []string{"ks1.t1"},
+			}, {
+				FromTable: "badname",
+				ToTables:  []string{"t1.t2.t3"},
 			}, {
 				FromTable: "unqualified",
 				ToTables:  []string{"t1"},
@@ -679,9 +685,6 @@ func TestVSchemaRoutingRules(t *testing.T) {
 			}, {
 				FromTable: "notfound",
 				ToTables:  []string{"ks1.t2"},
-			}, {
-				FromTable: "doubletable",
-				ToTables:  []string{"ks1.t1", "ks1.t1"},
 			}},
 		},
 		Keyspaces: map[string]*vschemapb.Keyspace{
@@ -710,7 +713,7 @@ func TestVSchemaRoutingRules(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&input)
+	got := BuildVSchema(&input)
 	ks1 := &Keyspace{
 		Name:    "ks1",
 		Sharded: true,
@@ -751,25 +754,28 @@ func TestVSchemaRoutingRules(t *testing.T) {
 	want := &VSchema{
 		RoutingRules: map[string]*RoutingRule{
 			"rt1": {
-				Tables: []*Table{t1, t2},
+				Error: errors.New("table rt1 has more than one target: [ks1.t1 ks2.t2]"),
 			},
 			"rt2": {
+				Tables: []*Table{t2},
+			},
+			"escaped": {
 				Tables: []*Table{t2},
 			},
 			"dup": {
 				Error: errors.New("duplicate rule for entry dup"),
 			},
+			"badname": {
+				Error: errors.New("invalid table name: t1.t2.t3"),
+			},
 			"unqualified": {
 				Error: errors.New("table t1 must be qualified"),
 			},
 			"badkeyspace": {
-				Error: errors.New("keyspace ks3 not found in vschema"),
+				Error: errors.New("Unknown database 'ks3' in vschema"),
 			},
 			"notfound": {
 				Error: errors.New("table t2 not found"),
-			},
-			"doubletable": {
-				Error: errors.New("table ks1.t1 specified more than once"),
 			},
 		},
 		uniqueTables: map[string]*Table{
@@ -801,11 +807,9 @@ func TestVSchemaRoutingRules(t *testing.T) {
 			},
 		},
 	}
-	if !reflect.DeepEqual(got, want) {
-		gotb, _ := json.Marshal(got)
-		wantb, _ := json.Marshal(want)
-		t.Errorf("BuildVSchema:\n%s, want\n%s", gotb, wantb)
-	}
+	gotb, _ := json.MarshalIndent(got, "", "  ")
+	wantb, _ := json.MarshalIndent(want, "", "  ")
+	assert.Equal(t, string(wantb), string(gotb), string(gotb))
 }
 
 func TestChooseVindexForType(t *testing.T) {
@@ -982,8 +986,7 @@ func TestFindBestColVindex(t *testing.T) {
 			},
 		},
 	}
-	vschema, err := BuildVSchema(testSrvVSchema)
-	require.NoError(t, err)
+	vs := BuildVSchema(testSrvVSchema)
 
 	testcases := []struct {
 		tablename  string
@@ -1006,7 +1009,7 @@ func TestFindBestColVindex(t *testing.T) {
 		err:       "table t2 has no vindex",
 	}}
 	for _, tcase := range testcases {
-		table, err := vschema.FindTable("", tcase.tablename)
+		table, err := vs.FindTable("", tcase.tablename)
 		require.NoError(t, err)
 		cv, err := FindBestColVindex(table)
 		if err != nil {
@@ -1157,7 +1160,7 @@ func TestShardedVSchemaMultiColumnVindex(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["sharded"].Error
 	require.NoError(t, err)
 	ks := &Keyspace{
@@ -1250,7 +1253,7 @@ func TestShardedVSchemaNotOwned(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["sharded"].Error
 	require.NoError(t, err)
 	ks := &Keyspace{
@@ -1342,7 +1345,7 @@ func TestBuildVSchemaVindexNotFoundFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := `vindexType "noexist" not found`
 	if err == nil || err.Error() != want {
@@ -1366,7 +1369,7 @@ func TestBuildVSchemaNoColumnVindexFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := "missing primary col vindex for table: t1"
 	if err == nil || err.Error() != want {
@@ -1399,7 +1402,7 @@ func TestBuildVSchemaDupSeq(t *testing.T) {
 	ksb := &Keyspace{
 		Name: "ksb",
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	t1a := &Table{
 		Name:     sqlparser.NewTableIdent("t1"),
 		Keyspace: ksa,
@@ -1468,7 +1471,7 @@ func TestBuildVSchemaDupTable(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	ksa := &Keyspace{
 		Name: "ksa",
 	}
@@ -1569,7 +1572,7 @@ func TestBuildVSchemaDupVindex(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["ksa"].Error
 	err1 := got.Keyspaces["ksb"].Error
 	require.NoError(t, err)
@@ -1689,7 +1692,7 @@ func TestBuildVSchemaNoindexFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := "vindex notexist not found for table t1"
 	if err == nil || err.Error() != want {
@@ -1721,7 +1724,7 @@ func TestBuildVSchemaColumnAndColumnsFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := `can't use column and columns at the same time in vindex (stfu) and table (t1)`
 	if err == nil || err.Error() != want {
@@ -1751,7 +1754,7 @@ func TestBuildVSchemaNoColumnsFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := `must specify at least one column for vindex (stfu) and table (t1)`
 	if err == nil || err.Error() != want {
@@ -1782,7 +1785,7 @@ func TestBuildVSchemaNotUniqueFail(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := "primary vindex stln is not Unique for table t1"
 	if err == nil || err.Error() != want {
@@ -1814,7 +1817,7 @@ func TestBuildVSchemaPrimaryCannotBeOwned(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := "primary vindex stlu cannot be owned for table t1"
 	if err == nil || err.Error() != want {
@@ -1864,14 +1867,14 @@ func TestSequence(t *testing.T) {
 						},
 						AutoIncrement: &vschemapb.AutoIncrement{
 							Column:   "c2",
-							Sequence: "unsharded.seq",
+							Sequence: "`unsharded`.`seq`",
 						},
 					},
 				},
 			},
 		},
 	}
-	got, _ := BuildVSchema(&good)
+	got := BuildVSchema(&good)
 	err := got.Keyspaces["sharded"].Error
 	require.NoError(t, err)
 	err1 := got.Keyspaces["unsharded"].Error
@@ -2030,7 +2033,7 @@ func TestBadSequence(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := "cannot resolve sequence invalid_seq: table invalid_seq not found"
 	if err == nil || err.Error() != want {
@@ -2078,11 +2081,11 @@ func TestBadSequenceName(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
-	want := "cannot resolve sequence a.b.seq: table a.b.seq not found"
-	if err == nil || err.Error() != want {
-		t.Errorf("BuildVSchema: %v, want %v", err, want)
+	want := "invalid table name: a.b.seq"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("BuildVSchema: %v, must contain %v", err, want)
 	}
 	if t1 := got.Keyspaces["sharded"].Tables["t1"]; t1 != nil {
 		t.Errorf("BuildVSchema: table t1 must not be present in the keyspace: %v", t1)
@@ -2102,7 +2105,7 @@ func TestBadShardedSequence(t *testing.T) {
 			},
 		},
 	}
-	got, _ := BuildVSchema(&bad)
+	got := BuildVSchema(&bad)
 	err := got.Keyspaces["sharded"].Error
 	want := "sequence table has to be in an unsharded keyspace or must be pinned: t1"
 	if err == nil || err.Error() != want {
@@ -2150,35 +2153,26 @@ func TestFindTable(t *testing.T) {
 			},
 		},
 	}
-	vschema, _ := BuildVSchema(&input)
+	vschema := BuildVSchema(&input)
 	_, err := vschema.FindTable("", "t1")
-	wantErr := "ambiguous table reference: t1"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTable(\"\"): %v, want %s", err, wantErr)
-	}
+	require.EqualError(t, err, "ambiguous table reference: t1")
+
 	_, err = vschema.FindTable("", "none")
-	wantErr = "table none not found"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTable(\"\"): %v, want %s", err, wantErr)
-	}
-	got, err := vschema.FindTable("", "ta")
-	if err != nil {
-		t.Error(err)
-		return
-	}
+	require.EqualError(t, err, "table none not found")
+
 	ta := &Table{
 		Name: sqlparser.NewTableIdent("ta"),
 		Keyspace: &Keyspace{
 			Name: "ksa",
 		},
 	}
-	if !reflect.DeepEqual(got, ta) {
-		t.Errorf("FindTable(\"t1a\"): %+v, want %+v", got, ta)
-	}
+	got, err := vschema.FindTable("", "ta")
+	require.NoError(t, err)
+	require.Equal(t, ta, got)
+
 	got, _ = vschema.FindTable("ksa", "ta")
-	if !reflect.DeepEqual(got, ta) {
-		t.Errorf("FindTable(\"t1a\"): %+v, want %+v", got, ta)
-	}
+	require.Equal(t, ta, got)
+
 	none := &Table{
 		Name: sqlparser.NewTableIdent("none"),
 		Keyspace: &Keyspace{
@@ -2186,30 +2180,24 @@ func TestFindTable(t *testing.T) {
 		},
 	}
 	got, _ = vschema.FindTable("ksa", "none")
-	if !reflect.DeepEqual(got, none) {
-		t.Errorf("FindTable(\"t1a\"): %+v, want %+v", got, none)
-	}
+	require.Equal(t, none, got)
+
 	_, err = vschema.FindTable("ksb", "none")
-	wantErr = "table none not found"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTable(\"\"): %v, want %s", err, wantErr)
-	}
+	require.EqualError(t, err, "table none not found")
+
 	_, err = vschema.FindTable("none", "aa")
-	wantErr = "keyspace none not found in vschema"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTable(\"\"): %v, want %s", err, wantErr)
-	}
+	require.EqualError(t, err, "Unknown database 'none' in vschema")
 }
 
-func TestFindTablesOrVindex(t *testing.T) {
+func TestFindTableOrVindex(t *testing.T) {
 	input := vschemapb.SrvVSchema{
 		RoutingRules: &vschemapb.RoutingRules{
 			Rules: []*vschemapb.RoutingRule{{
 				FromTable: "unqualified",
-				ToTables:  []string{"ksa.ta", "ksb.t1"},
+				ToTables:  []string{"ksa.ta"},
 			}, {
 				FromTable: "unqualified@replica",
-				ToTables:  []string{"ksb.t1", "ksa.ta"},
+				ToTables:  []string{"ksb.t1"},
 			}, {
 				FromTable: "newks.qualified",
 				ToTables:  []string{"ksa.ta"},
@@ -2263,31 +2251,31 @@ func TestFindTablesOrVindex(t *testing.T) {
 			},
 		},
 	}
-	vschema, _ := BuildVSchema(&input)
+	vschema := BuildVSchema(&input)
 	ta := vschema.Keyspaces["ksa"].Tables["ta"]
 	t1 := vschema.Keyspaces["ksb"].Tables["t1"]
 
-	_, _, err := vschema.FindTablesOrVindex("", "t1", topodatapb.TabletType_MASTER)
+	_, _, err := vschema.FindTableOrVindex("", "t1", topodatapb.TabletType_MASTER)
 	wantErr := "ambiguous table reference: t1"
 	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTablesOrVindex(\"\"): %v, want %s", err, wantErr)
+		t.Errorf("FindTableOrVindex(\"\"): %v, want %s", err, wantErr)
 	}
 
-	_, _, err = vschema.FindTablesOrVindex("", "none", topodatapb.TabletType_MASTER)
+	_, _, err = vschema.FindTableOrVindex("", "none", topodatapb.TabletType_MASTER)
 	wantErr = "table none not found"
 	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTablesOrVindex(\"\"): %v, want %s", err, wantErr)
+		t.Errorf("FindTableOrVindex(\"\"): %v, want %s", err, wantErr)
 	}
 
-	got, _, err := vschema.FindTablesOrVindex("", "ta", topodatapb.TabletType_MASTER)
+	got, _, err := vschema.FindTableOrVindex("", "ta", topodatapb.TabletType_MASTER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, []*Table{ta}) {
-		t.Errorf("FindTablesOrVindex(\"t1a\"): %+v, want %+v", got, ta)
+	if !reflect.DeepEqual(got, ta) {
+		t.Errorf("FindTableOrVindex(\"t1a\"): %+v, want %+v", got, ta)
 	}
 
-	_, vindex, err := vschema.FindTablesOrVindex("", "stfu1", topodatapb.TabletType_MASTER)
+	_, vindex, err := vschema.FindTableOrVindex("", "stfu1", topodatapb.TabletType_MASTER)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2295,10 +2283,10 @@ func TestFindTablesOrVindex(t *testing.T) {
 		name: "stfu1",
 	}
 	if !reflect.DeepEqual(vindex, wantVindex) {
-		t.Errorf("FindTablesOrVindex(\"stfu1\"): %+v, want %+v", vindex, wantVindex)
+		t.Errorf("FindTableOrVindex(\"stfu1\"): %+v, want %+v", vindex, wantVindex)
 	}
 
-	_, vindex, err = vschema.FindTablesOrVindex("ksc", "ta", topodatapb.TabletType_MASTER)
+	_, vindex, err = vschema.FindTableOrVindex("ksc", "ta", topodatapb.TabletType_MASTER)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2306,51 +2294,51 @@ func TestFindTablesOrVindex(t *testing.T) {
 		name: "ta",
 	}
 	if !reflect.DeepEqual(vindex, wantVindex) {
-		t.Errorf("FindTablesOrVindex(\"stfu1\"): %+v, want %+v", vindex, wantVindex)
+		t.Errorf("FindTableOrVindex(\"stfu1\"): %+v, want %+v", vindex, wantVindex)
 	}
 
-	_, _, err = vschema.FindTablesOrVindex("", "dup", topodatapb.TabletType_MASTER)
+	_, _, err = vschema.FindTableOrVindex("", "dup", topodatapb.TabletType_MASTER)
 	wantErr = "ambiguous vindex reference: dup"
 	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTablesOrVindex(\"\"): %v, want %s", err, wantErr)
+		t.Errorf("FindTableOrVindex(\"\"): %v, want %s", err, wantErr)
 	}
 
-	got, _, err = vschema.FindTablesOrVindex("", "unqualified", topodatapb.TabletType_MASTER)
+	got, _, err = vschema.FindTableOrVindex("", "unqualified", topodatapb.TabletType_MASTER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []*Table{ta, t1}; !reflect.DeepEqual(got, want) {
-		t.Errorf("FindTablesOrVindex(unqualified): %+v, want %+v", got, want)
+	if want := ta; !reflect.DeepEqual(got, want) {
+		t.Errorf("FindTableOrVindex(unqualified): %+v, want %+v", got, want)
 	}
 
-	got, _, err = vschema.FindTablesOrVindex("", "unqualified", topodatapb.TabletType_REPLICA)
+	got, _, err = vschema.FindTableOrVindex("", "unqualified", topodatapb.TabletType_REPLICA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []*Table{t1, ta}; !reflect.DeepEqual(got, want) {
-		t.Errorf("FindTablesOrVindex(unqualified): %+v, want %+v", got, want)
+	if want := t1; !reflect.DeepEqual(got, want) {
+		t.Errorf("FindTableOrVindex(unqualified): %+v, want %+v", got, want)
 	}
 
-	got, _, err = vschema.FindTablesOrVindex("newks", "qualified", topodatapb.TabletType_MASTER)
+	got, _, err = vschema.FindTableOrVindex("newks", "qualified", topodatapb.TabletType_MASTER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []*Table{ta}; !reflect.DeepEqual(got, want) {
-		t.Errorf("FindTablesOrVindex(unqualified): %+v, want %+v", got, want)
+	if want := ta; !reflect.DeepEqual(got, want) {
+		t.Errorf("FindTableOrVindex(unqualified): %+v, want %+v", got, want)
 	}
 
-	got, _, err = vschema.FindTablesOrVindex("newks", "qualified", topodatapb.TabletType_REPLICA)
+	got, _, err = vschema.FindTableOrVindex("newks", "qualified", topodatapb.TabletType_REPLICA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []*Table{t1}; !reflect.DeepEqual(got, want) {
-		t.Errorf("FindTablesOrVindex(unqualified): %+v, want %+v", got, want)
+	if want := t1; !reflect.DeepEqual(got, want) {
+		t.Errorf("FindTableOrVindex(unqualified): %+v, want %+v", got, want)
 	}
 
-	_, _, err = vschema.FindTablesOrVindex("", "notarget", topodatapb.TabletType_MASTER)
+	_, _, err = vschema.FindTableOrVindex("", "notarget", topodatapb.TabletType_MASTER)
 	wantErr = "table notarget has been disabled"
 	if err == nil || err.Error() != wantErr {
-		t.Errorf("FindTablesOrVindex(\"\"): %v, want %s", err, wantErr)
+		t.Errorf("FindTableOrVindex(\"\"): %v, want %s", err, wantErr)
 	}
 }
 
@@ -2606,7 +2594,7 @@ func TestFindSingleKeyspace(t *testing.T) {
 			},
 		},
 	}
-	vschema, _ := BuildVSchema(&input)
+	vschema := BuildVSchema(&input)
 	none := &Table{
 		Name: sqlparser.NewTableIdent("none"),
 		Keyspace: &Keyspace{
@@ -2647,7 +2635,7 @@ func TestFindSingleKeyspace(t *testing.T) {
 			},
 		},
 	}
-	vschema, _ = BuildVSchema(&input)
+	vschema = BuildVSchema(&input)
 	_, err := vschema.FindTable("", "none")
 	wantErr := "table none not found"
 	if err == nil || err.Error() != wantErr {

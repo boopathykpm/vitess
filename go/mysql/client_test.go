@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 )
 
 // assertSQLError makes sure we get the right error.
@@ -87,6 +87,16 @@ func TestConnectTimeout(t *testing.T) {
 	// Tests a connection timeout works.
 	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
 	_, err = Connect(ctx, params)
+	cancel()
+	if err != context.DeadlineExceeded {
+		t.Errorf("Was expecting context.DeadlineExceeded but got: %v", err)
+	}
+
+	// Tests a connection timeout through params
+	ctx = context.Background()
+	paramsWithTimeout := *params
+	paramsWithTimeout.ConnectTimeoutMs = 1
+	_, err = Connect(ctx, &paramsWithTimeout)
 	cancel()
 	if err != context.DeadlineExceeded {
 		t.Errorf("Was expecting context.DeadlineExceeded but got: %v", err)

@@ -87,30 +87,33 @@ type dataCollector struct {
 func Init(prefix string) {
 	// Needs to happen in servenv.OnRun() instead of init because it requires flag parsing and logging
 	servenv.OnRun(func() {
-		if *openTsdbURI == "" {
-			return
+		InitWithoutServenv(prefix)
+	})
+}
+
+// InitWithoutServenv initializes the opentsdb without servenv
+func InitWithoutServenv(prefix string) {
+	if *openTsdbURI == "" {
+		return
+	}
+
+	backend := &openTSDBBackend{
+		prefix:     prefix,
+		commonTags: stats.ParseCommonTags(*stats.CommonTags),
+	}
+
+	stats.RegisterPushBackend("opentsdb", backend)
+
+	http.HandleFunc("/debug/opentsdb", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		dataPoints := (*backend).getDataPoints()
+		sort.Sort(byMetric(dataPoints))
+
+		if b, err := json.MarshalIndent(dataPoints, "", "  "); err != nil {
+			w.Write([]byte(err.Error()))
+		} else {
+			w.Write(b)
 		}
-
-		backend := &openTSDBBackend{
-			prefix: prefix,
-			// If you want to global service values like host, service name, git revision, etc,
-			// this is the place to do it.
-			commonTags: map[string]string{},
-		}
-
-		stats.RegisterPushBackend("opentsdb", backend)
-
-		http.HandleFunc("/debug/opentsdb", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			dataPoints := (*backend).getDataPoints()
-			sort.Sort(byMetric(dataPoints))
-
-			if b, err := json.MarshalIndent(dataPoints, "", "  "); err != nil {
-				w.Write([]byte(err.Error()))
-			} else {
-				w.Write(b)
-			}
-		})
 	})
 }
 
@@ -214,7 +217,7 @@ func (dc *dataCollector) addExpVar(kv expvar.KeyValue) {
 	case *stats.MultiTimings:
 		dc.addTimings(v.Labels(), &v.Timings, k)
 	case *stats.Timings:
-		dc.addTimings([]string{"Histograms"}, v, k)
+		dc.addTimings([]string{v.Label()}, v, k)
 	case *stats.Histogram:
 		dc.addHistogram(v, 1, k, make(map[string]string))
 	case *stats.CountersWithSingleLabel:

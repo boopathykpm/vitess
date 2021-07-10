@@ -21,9 +21,10 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
@@ -67,9 +68,9 @@ func (*Numeric) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool,
 	out := make([]bool, len(ids))
 	for i := range ids {
 		var keybytes [8]byte
-		num, err := sqltypes.ToUint64(ids[i])
+		num, err := evalengine.ToUint64(ids[i])
 		if err != nil {
-			return nil, vterrors.Wrap(err, "Numeric.Verify")
+			return nil, err
 		}
 		binary.BigEndian.PutUint64(keybytes[:], num)
 		out[i] = bytes.Equal(keybytes[:], ksids[i])
@@ -81,7 +82,7 @@ func (*Numeric) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool,
 func (*Numeric) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
 	out := make([]key.Destination, 0, len(ids))
 	for _, id := range ids {
-		num, err := sqltypes.ToUint64(id)
+		num, err := evalengine.ToUint64(id)
 		if err != nil {
 			out = append(out, key.DestinationNone{})
 			continue

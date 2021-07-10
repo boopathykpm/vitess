@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
@@ -51,9 +52,10 @@ func TestMain(m *testing.M) {
 		defer env.Close()
 
 		// engine cannot be initialized in testenv because it introduces
-		// circular dependencies.
-		engine = NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine)
-		engine.Open(env.KeyspaceName, env.Cells[0])
+		// circular dependencies
+		engine = NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
+		engine.InitDBConfig(env.KeyspaceName)
+		engine.Open()
 		defer engine.Close()
 
 		return m.Run()
@@ -65,8 +67,11 @@ func customEngine(t *testing.T, modifier func(mysql.ConnParams) mysql.ConnParams
 	original, err := env.Dbcfgs.AppWithDB().MysqlParams()
 	require.NoError(t, err)
 	modified := modifier(*original)
-	dbcfgs := dbconfigs.NewTestDBConfigs(modified, modified, modified.DbName)
-	engine := NewEngine(tabletenv.NewTestEnv(env.TabletEnv.Config(), dbcfgs, "VStreamerTest"), env.SrvTopo, env.SchemaEngine)
-	engine.Open(env.KeyspaceName, env.Cells[0])
+	config := env.TabletEnv.Config().Clone()
+	config.DB = dbconfigs.NewTestDBConfigs(modified, modified, modified.DbName)
+
+	engine := NewEngine(tabletenv.NewEnv(config, "VStreamerTest"), env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
+	engine.InitDBConfig(env.KeyspaceName)
+	engine.Open()
 	return engine
 }

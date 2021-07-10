@@ -19,12 +19,16 @@ package wrangler
 import (
 	"fmt"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -61,7 +65,6 @@ func newTestMaterializerEnv(t *testing.T, ms *vtctldatapb.MaterializeSettings, s
 		tmc:      newTestMaterializerTMClient(),
 	}
 	env.wr = New(logutil.NewConsoleLogger(), env.topoServ, env.tmc)
-
 	tabletID := 100
 	for _, shard := range sources {
 		_ = env.addTablet(tabletID, env.ms.SourceKeyspace, shard, topodatapb.TabletType_MASTER)
@@ -76,18 +79,20 @@ func newTestMaterializerEnv(t *testing.T, ms *vtctldatapb.MaterializeSettings, s
 	}
 
 	for _, ts := range ms.TableSettings {
-		tablename := ts.TargetTable
+		tableName := ts.TargetTable
 		table, err := sqlparser.TableFromStatement(ts.SourceExpression)
 		if err == nil {
-			tablename = table.Name.String()
+			tableName = table.Name.String()
 		}
-		env.tmc.schema[ms.SourceKeyspace+"."+tablename] = &tabletmanagerdatapb.SchemaDefinition{
+		env.tmc.schema[ms.SourceKeyspace+"."+tableName] = &tabletmanagerdatapb.SchemaDefinition{
 			TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
-				Schema: fmt.Sprintf("%s_schema", tablename),
+				Name:   tableName,
+				Schema: fmt.Sprintf("%s_schema", tableName),
 			}},
 		}
 		env.tmc.schema[ms.TargetKeyspace+"."+ts.TargetTable] = &tabletmanagerdatapb.SchemaDefinition{
 			TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+				Name:   ts.TargetTable,
 				Schema: fmt.Sprintf("%s_schema", ts.TargetTable),
 			}},
 		}
@@ -157,23 +162,62 @@ type testMaterializerTMClient struct {
 	tmclient.TabletManagerClient
 	schema map[string]*tabletmanagerdatapb.SchemaDefinition
 
-	mu        sync.Mutex
-	vrQueries map[int][]*queryResult
+	mu              sync.Mutex
+	vrQueries       map[int][]*queryResult
+	getSchemaCounts map[string]int
+	muSchemaCount   sync.Mutex
 }
 
 func newTestMaterializerTMClient() *testMaterializerTMClient {
 	return &testMaterializerTMClient{
-		schema:    make(map[string]*tabletmanagerdatapb.SchemaDefinition),
-		vrQueries: make(map[int][]*queryResult),
+		schema:          make(map[string]*tabletmanagerdatapb.SchemaDefinition),
+		vrQueries:       make(map[int][]*queryResult),
+		getSchemaCounts: make(map[string]int),
 	}
 }
 
-func (tmc *testMaterializerTMClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
-	key := tablet.Keyspace + "." + tables[0]
-	if tmc.schema[key] == nil {
-		return &tabletmanagerdatapb.SchemaDefinition{}, nil
+func (tmc *testMaterializerTMClient) schemaRequested(uid uint32) {
+	tmc.muSchemaCount.Lock()
+	defer tmc.muSchemaCount.Unlock()
+	key := strconv.Itoa(int(uid))
+	n, ok := tmc.getSchemaCounts[key]
+	if !ok {
+		tmc.getSchemaCounts[key] = 1
+	} else {
+		tmc.getSchemaCounts[key] = n + 1
 	}
-	return tmc.schema[key], nil
+}
+
+func (tmc *testMaterializerTMClient) getSchemaRequestCount(uid uint32) int {
+	tmc.muSchemaCount.Lock()
+	defer tmc.muSchemaCount.Unlock()
+	key := strconv.Itoa(int(uid))
+	return tmc.getSchemaCounts[key]
+}
+
+func (tmc *testMaterializerTMClient) GetSchema(ctx context.Context, tablet *topodatapb.Tablet, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error) {
+	tmc.schemaRequested(tablet.Alias.Uid)
+	schemaDefn := &tabletmanagerdatapb.SchemaDefinition{}
+	for _, table := range tables {
+		// TODO: Add generalized regexps if needed for test purposes.
+		if table == "/.*/" {
+			// Special case of all tables in keyspace.
+			for key, tableDefn := range tmc.schema {
+				if strings.HasPrefix(key, tablet.Keyspace+".") {
+					schemaDefn.TableDefinitions = append(schemaDefn.TableDefinitions, tableDefn.TableDefinitions...)
+				}
+			}
+			break
+		}
+
+		key := tablet.Keyspace + "." + table
+		tableDefn := tmc.schema[key]
+		if tableDefn == nil {
+			continue
+		}
+		schemaDefn.TableDefinitions = append(schemaDefn.TableDefinitions, tableDefn.TableDefinitions...)
+	}
+	return schemaDefn, nil
 }
 
 func (tmc *testMaterializerTMClient) expectVRQuery(tabletID int, query string, result *sqltypes.Result) {
@@ -224,7 +268,21 @@ func (tmc *testMaterializerTMClient) verifyQueries(t *testing.T) {
 			for _, qr := range qrs {
 				list = append(list, qr.query)
 			}
-			t.Errorf("tablet %v: has unreturned results: %v", tabletID, list)
+			t.Errorf("tablet %v: found queries that were expected but never got executed by the test: %v", tabletID, list)
 		}
 	}
+}
+
+// Note: ONLY breaks up change.SQL into individual statements and executes it. Does NOT fully implement ApplySchema.
+func (tmc *testMaterializerTMClient) ApplySchema(ctx context.Context, tablet *topodatapb.Tablet, change *tmutils.SchemaChange) (*tabletmanagerdatapb.SchemaChangeResult, error) {
+	stmts := strings.Split(change.SQL, ";")
+
+	for _, stmt := range stmts {
+		_, err := tmc.ExecuteFetchAsDba(ctx, tablet, false, []byte(stmt), 0, false, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return nil, nil
 }

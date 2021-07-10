@@ -22,15 +22,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/encoding/prototext"
+
 	"vitess.io/vitess/go/exit"
 	"vitess.io/vitess/go/vt/dbconfigs"
-	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
@@ -43,6 +44,7 @@ import (
 	"vitess.io/vitess/go/vt/vtctld"
 	"vitess.io/vitess/go/vt/vtgate"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
@@ -53,13 +55,54 @@ var (
 
 	schemaDir = flag.String("schema_dir", "", "Schema base directory. Should contain one directory per keyspace, with a vschema.json file if necessary.")
 
+	startMysql = flag.Bool("start_mysql", false, "Should vtcombo also start mysql")
+
+	mysqlPort = flag.Int("mysql_port", 3306, "mysql port")
+
 	ts              *topo.Server
 	resilientServer *srvtopo.ResilientServer
-	healthCheck     discovery.HealthCheck
 )
 
 func init() {
 	servenv.RegisterDefaultFlags()
+}
+
+func startMysqld(uid uint32) (*mysqlctl.Mysqld, *mysqlctl.Mycnf) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	mycnfFile := mysqlctl.MycnfFile(uid)
+
+	var mysqld *mysqlctl.Mysqld
+	var cnf *mysqlctl.Mycnf
+	var err error
+
+	if _, statErr := os.Stat(mycnfFile); os.IsNotExist(statErr) {
+		mysqld, cnf, err = mysqlctl.CreateMysqldAndMycnf(uid, "", int32(*mysqlPort))
+		if err != nil {
+			log.Errorf("failed to initialize mysql config :%v", err)
+			exit.Return(1)
+		}
+		if err := mysqld.Init(ctx, cnf, ""); err != nil {
+			log.Errorf("failed to initialize mysql :%v", err)
+			exit.Return(1)
+		}
+	} else {
+		mysqld, cnf, err = mysqlctl.OpenMysqldAndMycnf(uid)
+		if err != nil {
+			log.Errorf("failed to find mysql config: %v", err)
+			exit.Return(1)
+		}
+		err = mysqld.RefreshConfig(ctx, cnf)
+		if err != nil {
+			log.Errorf("failed to refresh config: %v", err)
+			exit.Return(1)
+		}
+		if err := mysqld.Start(ctx, cnf); err != nil {
+			log.Errorf("Failed to start mysqld: %v", err)
+			exit.Return(1)
+		}
+	}
+	cancel()
+	return mysqld, cnf
 }
 
 func main() {
@@ -72,7 +115,7 @@ func main() {
 
 	// parse the input topology
 	tpb := &vttestpb.VTTestTopology{}
-	if err := proto.UnmarshalText(*protoTopo, tpb); err != nil {
+	if err := prototext.Unmarshal([]byte(*protoTopo), tpb); err != nil {
 		log.Errorf("cannot parse topology: %v", err)
 		exit.Return(1)
 	}
@@ -97,31 +140,71 @@ func main() {
 	servenv.Init()
 	tabletenv.Init()
 
-	dbcfgs, err := dbconfigs.Init("")
-	if err != nil {
-		log.Warning(err)
+	var mysqld *mysqlctl.Mysqld
+	var cnf *mysqlctl.Mycnf
+	if *startMysql {
+		mysqld, cnf = startMysqld(1)
+		servenv.OnClose(func() {
+			mysqld.Shutdown(context.TODO(), cnf, true)
+		})
+		// We want to ensure we can write to this database
+		mysqld.SetReadOnly(false)
+
+	} else {
+		dbconfigs.GlobalDBConfigs.InitWithSocket("")
+		mysqld = mysqlctl.NewMysqld(&dbconfigs.GlobalDBConfigs)
+		servenv.OnClose(mysqld.Close)
 	}
-	mysqld := mysqlctl.NewMysqld(dbcfgs)
-	servenv.OnClose(mysqld.Close)
 
 	// tablets configuration and init.
 	// Send mycnf as nil because vtcombo won't do backups and restores.
-	if err := vtcombo.InitTabletMap(ts, tpb, mysqld, dbcfgs, *schemaDir, nil); err != nil {
+	uid, err := vtcombo.InitTabletMap(ts, tpb, mysqld, &dbconfigs.GlobalDBConfigs, *schemaDir, *startMysql)
+	if err != nil {
 		log.Errorf("initTabletMapProto failed: %v", err)
+		// ensure we start mysql in the event we fail here
+		if *startMysql {
+			mysqld.Shutdown(context.TODO(), cnf, true)
+		}
 		exit.Return(1)
 	}
 
-	// Now that we have fully initialized the tablets, rebuild the keyspace graph. This is what would normally happen in InitTablet.
-	for _, ks := range tpb.Keyspaces {
-		err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, ks.GetName(), tpb.Cells)
+	globalCreateDb = func(ctx context.Context, ks *vttestpb.Keyspace) error {
+		wr := wrangler.New(logutil.NewConsoleLogger(), ts, nil)
+		newUID, err := vtcombo.CreateKs(ctx, ts, tpb, mysqld, &dbconfigs.GlobalDBConfigs, *schemaDir, ks, true, uid, wr)
 		if err != nil {
+			return err
+		}
+		uid = newUID
+		tpb.Keyspaces = append(tpb.Keyspaces, ks)
+		return nil
+	}
+
+	globalDropDb = func(ctx context.Context, ksName string) error {
+		if err := vtcombo.DeleteKs(ctx, ts, ksName, mysqld, tpb); err != nil {
+			return err
+		}
+
+		// Rebuild the SrvVSchema object
+		if err := ts.RebuildSrvVSchema(ctx, tpb.Cells); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// Now that we have fully initialized the tablets, rebuild the keyspace graph.
+	for _, ks := range tpb.Keyspaces {
+		err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, ks.GetName(), tpb.Cells, false)
+		if err != nil {
+			if *startMysql {
+				mysqld.Shutdown(context.TODO(), cnf, true)
+			}
 			log.Fatalf("Couldn't build srv keyspace for (%v: %v). Got error: %v", ks, tpb.Cells, err)
 		}
 	}
 
 	// vtgate configuration and init
 	resilientServer = srvtopo.NewResilientServer(ts, "ResilientSrvTopoServer")
-	healthCheck = discovery.NewHealthCheck(1*time.Millisecond /*retryDelay*/, 1*time.Hour /*healthCheckTimeout*/)
 	tabletTypesToWait := []topodatapb.TabletType{
 		topodatapb.TabletType_MASTER,
 		topodatapb.TabletType_REPLICA,
@@ -131,7 +214,7 @@ func main() {
 	vtgate.QueryLogHandler = "/debug/vtgate/querylog"
 	vtgate.QueryLogzHandler = "/debug/vtgate/querylogz"
 	vtgate.QueryzHandler = "/debug/vtgate/queryz"
-	vtg := vtgate.Init(context.Background(), healthCheck, resilientServer, tpb.Cells[0], 2 /*retryCount*/, tabletTypesToWait)
+	vtg := vtgate.Init(context.Background(), resilientServer, tpb.Cells[0], tabletTypesToWait)
 
 	// vtctld configuration and init
 	vtctld.InitVtctld(ts)
@@ -141,6 +224,7 @@ func main() {
 	})
 
 	servenv.OnTerm(func() {
+		log.Error("Terminating")
 		// FIXME(alainjobart): stop vtgate
 	})
 	servenv.OnClose(func() {

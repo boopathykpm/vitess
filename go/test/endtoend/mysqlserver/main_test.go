@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"testing"
 
 	"vitess.io/vitess/go/mysql"
@@ -40,7 +41,14 @@ var (
 		keyspace_id bigint(20) unsigned NOT NULL,
 		data longblob,
 		primary key (id)
-		) Engine=InnoDB`
+		) Engine=InnoDB;
+`
+	createProcSQL = `use vt_test_keyspace;
+CREATE PROCEDURE testing()
+BEGIN
+	delete from vt_insert_test;
+END;
+`
 )
 
 func TestMain(m *testing.M) {
@@ -49,7 +57,7 @@ func TestMain(m *testing.M) {
 
 	// setting grpc max size
 	if os.Getenv("grpc_max_massage_size") == "" {
-		os.Setenv("grpc_max_message_size", fmt.Sprint(16*1024*1024))
+		os.Setenv("grpc_max_message_size", strconv.FormatInt(16*1024*1024, 10))
 	}
 
 	exitcode, err := func() (int, error) {
@@ -97,6 +105,7 @@ func TestMain(m *testing.M) {
 			"-mysql_auth_server_impl", "static",
 			"-mysql_auth_server_static_file", clusterInstance.TmpDirectory + mysqlAuthServerStatic,
 			"-mysql_server_version", "8.0.16-7",
+			"-warn_sharded_only=true",
 		}
 
 		clusterInstance.VtTabletExtraArgs = []string{
@@ -123,6 +132,11 @@ func TestMain(m *testing.M) {
 			Port:  clusterInstance.VtgateMySQLPort,
 			Uname: "testuser1",
 			Pass:  "testpassword1",
+		}
+
+		masterProcess := clusterInstance.Keyspaces[0].Shards[0].MasterTablet().VttabletProcess
+		if _, err := masterProcess.QueryTablet(createProcSQL, keyspaceName, false); err != nil {
+			return 1, err
 		}
 
 		return m.Run(), nil

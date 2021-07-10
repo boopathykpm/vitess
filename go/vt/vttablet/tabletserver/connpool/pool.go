@@ -20,9 +20,10 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/pools"
+	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -50,20 +51,26 @@ type Pool struct {
 	connections        *pools.ResourcePool
 	capacity           int
 	prefillParallelism int
+	timeout            time.Duration
 	idleTimeout        time.Duration
+	waiterCap          int64
+	waiterCount        sync2.AtomicInt64
 	dbaPool            *dbconnpool.ConnectionPool
 	appDebugParams     dbconfigs.Connector
 }
 
-// New creates a new Pool. The name is used
+// NewPool creates a new Pool. The name is used
 // to publish stats only.
-func New(env tabletenv.Env, name string, capacity int, prefillParallelism int, idleTimeout time.Duration) *Pool {
+func NewPool(env tabletenv.Env, name string, cfg tabletenv.ConnPoolConfig) *Pool {
+	idleTimeout := cfg.IdleTimeoutSeconds.Get()
 	cp := &Pool{
 		env:                env,
 		name:               name,
-		capacity:           capacity,
-		prefillParallelism: prefillParallelism,
+		capacity:           cfg.Size,
+		prefillParallelism: cfg.PrefillParallelism,
+		timeout:            cfg.TimeoutSeconds.Get(),
 		idleTimeout:        idleTimeout,
+		waiterCap:          int64(cfg.MaxWaiters),
 		dbaPool:            dbconnpool.NewConnectionPool("", 1, idleTimeout, 0),
 	}
 	if name == "" {
@@ -99,8 +106,8 @@ func (cp *Pool) Open(appParams, dbaParams, appDebugParams dbconfigs.Connector) {
 		defer log.Infof("Done opening pool: '%s'", cp.name)
 	}
 
-	f := func() (pools.Resource, error) {
-		return NewDBConn(cp, appParams)
+	f := func(ctx context.Context) (pools.Resource, error) {
+		return NewDBConn(ctx, cp, appParams)
 	}
 	cp.connections = pools.NewResourcePool(f, cp.capacity, cp.capacity, cp.idleTimeout, cp.prefillParallelism, cp.getLogWaitCallback())
 	cp.appDebugParams = appDebugParams
@@ -139,8 +146,16 @@ func (cp *Pool) Get(ctx context.Context) (*DBConn, error) {
 	span, ctx := trace.NewSpan(ctx, "Pool.Get")
 	defer span.Finish()
 
+	if cp.waiterCap > 0 {
+		waiterCount := cp.waiterCount.Add(1)
+		defer cp.waiterCount.Add(-1)
+		if waiterCount > cp.waiterCap {
+			return nil, vterrors.Errorf(vtrpcpb.Code_RESOURCE_EXHAUSTED, "pool %s waiter count exceeded", cp.name)
+		}
+	}
+
 	if cp.isCallerIDAppDebug(ctx) {
-		return NewDBConnNoPool(cp.appDebugParams, cp.dbaPool)
+		return NewDBConnNoPool(ctx, cp.appDebugParams, cp.dbaPool)
 	}
 	p := cp.pool()
 	if p == nil {
@@ -151,6 +166,11 @@ func (cp *Pool) Get(ctx context.Context) (*DBConn, error) {
 	span.Annotate("available", p.Available())
 	span.Annotate("active", p.Active())
 
+	if cp.timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cp.timeout)
+		defer cancel()
+	}
 	r, err := p.Get(ctx)
 	if err != nil {
 		return nil, err

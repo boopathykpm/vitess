@@ -20,6 +20,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
 
@@ -37,12 +39,11 @@ func TestInsertUnsharded(t *testing.T) {
 		"dummy_insert",
 	)
 
-	vc := &loggingVCursor{
-		shards: []string{"0"},
-		results: []*sqltypes.Result{{
-			InsertID: 4,
-		}},
-	}
+	vc := newDMLTestVCursor("0")
+	vc.results = []*sqltypes.Result{{
+		InsertID: 4,
+	}}
+
 	result, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -56,11 +57,11 @@ func TestInsertUnsharded(t *testing.T) {
 	// Failure cases
 	vc = &loggingVCursor{shardErr: errors.New("shard_error")}
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertUnsharded: shard_error")
+	require.EqualError(t, err, `shard_error`)
 
 	vc = &loggingVCursor{}
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "Keyspace does not have exactly one shard: []")
+	require.EqualError(t, err, `Keyspace does not have exactly one shard: []`)
 }
 
 func TestInsertUnshardedGenerate(t *testing.T) {
@@ -89,19 +90,18 @@ func TestInsertUnshardedGenerate(t *testing.T) {
 		},
 	}
 
-	vc := &loggingVCursor{
-		shards: []string{"0"},
-		results: []*sqltypes.Result{
-			sqltypes.MakeTestResult(
-				sqltypes.MakeTestFields(
-					"nextval",
-					"int64",
-				),
-				"4",
+	vc := newDMLTestVCursor("0")
+	vc.results = []*sqltypes.Result{
+		sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"nextval",
+				"int64",
 			),
-			{InsertID: 1},
-		},
+			"4",
+		),
+		{InsertID: 1},
 	}
+
 	result, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -109,10 +109,65 @@ func TestInsertUnshardedGenerate(t *testing.T) {
 	vc.ExpectLog(t, []string{
 		// Fetch two sequence value.
 		`ResolveDestinations ks2 [] Destinations:DestinationAnyShard()`,
-		`ExecuteStandalone dummy_generate n: type:INT64 value:"2"  ks2 0`,
+		`ExecuteStandalone dummy_generate n: type:INT64 value:"2" ks2 0`,
 		// Fill those values into the insert.
 		`ResolveDestinations ks [] Destinations:DestinationAllShards()`,
-		`ExecuteMultiShard ks.0: dummy_insert {__seq0: type:INT64 value:"1" __seq1: type:INT64 value:"4" __seq2: type:INT64 value:"2" __seq3: type:INT64 value:"5" __seq4: type:INT64 value:"3" } true true`,
+		`ExecuteMultiShard ks.0: dummy_insert {__seq0: type:INT64 value:"1" __seq1: type:INT64 value:"4" __seq2: type:INT64 value:"2" __seq3: type:INT64 value:"5" __seq4: type:INT64 value:"3"} true true`,
+	})
+
+	// The insert id returned by ExecuteMultiShard should be overwritten by processGenerate.
+	expectResult(t, "Execute", result, &sqltypes.Result{InsertID: 4})
+}
+
+func TestInsertUnshardedGenerate_Zeros(t *testing.T) {
+	ins := NewQueryInsert(
+		InsertUnsharded,
+		&vindexes.Keyspace{
+			Name:    "ks",
+			Sharded: false,
+		},
+		"dummy_insert",
+	)
+	ins.Generate = &Generate{
+		Keyspace: &vindexes.Keyspace{
+			Name:    "ks2",
+			Sharded: false,
+		},
+		Query: "dummy_generate",
+		Values: sqltypes.PlanValue{
+			Values: []sqltypes.PlanValue{
+				{Value: sqltypes.NewInt64(1)},
+				{Value: sqltypes.NewInt64(0)},
+				{Value: sqltypes.NewInt64(2)},
+				{Value: sqltypes.NewInt64(0)},
+				{Value: sqltypes.NewInt64(3)},
+			},
+		},
+	}
+
+	vc := newDMLTestVCursor("0")
+	vc.results = []*sqltypes.Result{
+		sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"nextval",
+				"int64",
+			),
+			"4",
+		),
+		{InsertID: 1},
+	}
+
+	result, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vc.ExpectLog(t, []string{
+		// Fetch two sequence value.
+		`ResolveDestinations ks2 [] Destinations:DestinationAnyShard()`,
+		`ExecuteStandalone dummy_generate n: type:INT64 value:"2" ks2 0`,
+		// Fill those values into the insert.
+		`ResolveDestinations ks [] Destinations:DestinationAllShards()`,
+		`ExecuteMultiShard ks.0: dummy_insert {__seq0: type:INT64 value:"1" __seq1: type:INT64 value:"4" __seq2: type:INT64 value:"2" __seq3: type:INT64 value:"5" __seq4: type:INT64 value:"3"} true true`,
 	})
 
 	// The insert id returned by ExecuteMultiShard should be overwritten by processGenerate.
@@ -140,10 +195,7 @@ func TestInsertShardedSimple(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	// A single row insert should be autocommitted
@@ -164,20 +216,19 @@ func TestInsertShardedSimple(t *testing.T) {
 		[]string{" mid1"},
 		" suffix",
 	)
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
 		// Based on shardForKsid, values returned will be 20-.
-		`ResolveDestinations sharded [value:"0" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
+		`ResolveDestinations sharded [value:"0"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
 		// Row 2 will go to -20, rows 1 & 3 will go to 20-
 		`ExecuteMultiShard ` +
-			`sharded.20-: prefix mid1 suffix {_id0: type:INT64 value:"1" } ` +
+			`sharded.20-: prefix mid1 suffix {_id_0: type:INT64 value:"1"} ` +
 			`true true`,
 	})
 
@@ -203,21 +254,20 @@ func TestInsertShardedSimple(t *testing.T) {
 		[]string{" mid1", " mid2", " mid3"},
 		" suffix",
 	)
-	vc = &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-	}
+	vc = newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
 		// Based on shardForKsid, values returned will be 20-, -20, 20-.
-		`ResolveDestinations sharded [value:"0"  value:"1"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"1" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		// Row 2 will go to -20, rows 1 & 3 will go to 20-
 		`ExecuteMultiShard ` +
-			`sharded.20-: prefix mid1, mid3 suffix {_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
-			`sharded.-20: prefix mid2 suffix {_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`sharded.20-: prefix mid1, mid3 suffix {_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
+			`sharded.-20: prefix mid2 suffix {_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`true false`,
 	})
 
@@ -245,21 +295,20 @@ func TestInsertShardedSimple(t *testing.T) {
 	)
 	ins.MultiShardAutocommit = true
 
-	vc = &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-	}
+	vc = newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+
 	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
 		// Based on shardForKsid, values returned will be 20-, -20, 20-.
-		`ResolveDestinations sharded [value:"0"  value:"1"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"1" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		// Row 2 will go to -20, rows 1 & 3 will go to 20-
 		`ExecuteMultiShard ` +
-			`sharded.20-: prefix mid1, mid3 suffix {_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
-			`sharded.-20: prefix mid2 suffix {_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`sharded.20-: prefix mid1, mid3 suffix {_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
+			`sharded.-20: prefix mid2 suffix {_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`true true`,
 	})
 }
@@ -290,10 +339,7 @@ func TestInsertShardedFail(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -317,8 +363,8 @@ func TestInsertShardedFail(t *testing.T) {
 	vc := &loggingVCursor{}
 
 	// The lookup will fail to map to a keyspace id.
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertSharded: getInsertShardedRoute: could not map [INT64(1)] to a keyspace id")
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	require.EqualError(t, err, `could not map [INT64(1)] to a keyspace id`)
 }
 
 func TestInsertShardedGenerate(t *testing.T) {
@@ -342,10 +388,7 @@ func TestInsertShardedGenerate(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -385,37 +428,36 @@ func TestInsertShardedGenerate(t *testing.T) {
 		},
 	}
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-		results: []*sqltypes.Result{
-			sqltypes.MakeTestResult(
-				sqltypes.MakeTestFields(
-					"nextval",
-					"int64",
-				),
-				"2",
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+	vc.results = []*sqltypes.Result{
+		sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"nextval",
+				"int64",
 			),
-			{InsertID: 1},
-		},
+			"2",
+		),
+		{InsertID: 1},
 	}
+
 	result, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
 		`ResolveDestinations ks2 [] Destinations:DestinationAnyShard()`,
-		`ExecuteStandalone dummy_generate n: type:INT64 value:"1"  ks2 -20`,
+		`ExecuteStandalone dummy_generate n: type:INT64 value:"1" ks2 -20`,
 		// Based on shardForKsid, values returned will be 20-, -20, 20-.
-		`ResolveDestinations sharded [value:"0"  value:"1"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"1" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		// Row 2 will go to -20, rows 1 & 3 will go to 20-
 		`ExecuteMultiShard ` +
 			`sharded.20-: prefix mid1, mid3 suffix ` +
 			`{__seq0: type:INT64 value:"1" __seq1: type:INT64 value:"2" __seq2: type:INT64 value:"2" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`sharded.-20: prefix mid2 suffix ` +
 			`{__seq0: type:INT64 value:"1" __seq1: type:INT64 value:"2" __seq2: type:INT64 value:"2" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`true false`,
 	})
 
@@ -468,10 +510,7 @@ func TestInsertShardedOwned(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -529,35 +568,34 @@ func TestInsertShardedOwned(t *testing.T) {
 		" suffix",
 	)
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`Execute insert into lkp2(from1, from2, toc) values(:from10, :from20, :toc0), (:from11, :from21, :toc1), (:from12, :from22, :toc2) ` +
-			`from10: type:INT64 value:"4" from11: type:INT64 value:"5" from12: type:INT64 value:"6" ` +
-			`from20: type:INT64 value:"7" from21: type:INT64 value:"8" from22: type:INT64 value:"9" ` +
-			`toc0: type:VARBINARY value:"\026k@\264J\272K\326" toc1: type:VARBINARY value:"\006\347\352\"\316\222p\217" toc2: type:VARBINARY value:"N\261\220\311\242\372\026\234"  true`,
-		`Execute insert into lkp1(from, toc) values(:from0, :toc0), (:from1, :toc1), (:from2, :toc2) ` +
-			`from0: type:INT64 value:"10" from1: type:INT64 value:"11" from2: type:INT64 value:"12" ` +
-			`toc0: type:VARBINARY value:"\026k@\264J\272K\326" toc1: type:VARBINARY value:"\006\347\352\"\316\222p\217" toc2: type:VARBINARY value:"N\261\220\311\242\372\026\234"  true`,
+		`Execute insert into lkp2(from1, from2, toc) values(:from1_0, :from2_0, :toc_0), (:from1_1, :from2_1, :toc_1), (:from1_2, :from2_2, :toc_2) ` +
+			`from1_0: type:INT64 value:"4" from1_1: type:INT64 value:"5" from1_2: type:INT64 value:"6" ` +
+			`from2_0: type:INT64 value:"7" from2_1: type:INT64 value:"8" from2_2: type:INT64 value:"9" ` +
+			`toc_0: type:VARBINARY value:"\x16k@\xb4J\xbaK\xd6" toc_1: type:VARBINARY value:"\x06\xe7\xea\"Βp\x8f" toc_2: type:VARBINARY value:"N\xb1\x90ɢ\xfa\x16\x9c" true`,
+		`Execute insert into lkp1(from, toc) values(:from_0, :toc_0), (:from_1, :toc_1), (:from_2, :toc_2) ` +
+			`from_0: type:INT64 value:"10" from_1: type:INT64 value:"11" from_2: type:INT64 value:"12" ` +
+			`toc_0: type:VARBINARY value:"\x16k@\xb4J\xbaK\xd6" toc_1: type:VARBINARY value:"\x06\xe7\xea\"Βp\x8f" toc_2: type:VARBINARY value:"N\xb1\x90ɢ\xfa\x16\x9c" true`,
 		// Based on shardForKsid, values returned will be 20-, -20, 20-.
-		`ResolveDestinations sharded [value:"0"  value:"1"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"1" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		`ExecuteMultiShard ` +
 			`sharded.20-: prefix mid1, mid3 suffix ` +
-			`{_c10: type:INT64 value:"4" _c11: type:INT64 value:"5" _c12: type:INT64 value:"6" ` +
-			`_c20: type:INT64 value:"7" _c21: type:INT64 value:"8" _c22: type:INT64 value:"9" ` +
-			`_c30: type:INT64 value:"10" _c31: type:INT64 value:"11" _c32: type:INT64 value:"12" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`{_c1_0: type:INT64 value:"4" _c1_1: type:INT64 value:"5" _c1_2: type:INT64 value:"6" ` +
+			`_c2_0: type:INT64 value:"7" _c2_1: type:INT64 value:"8" _c2_2: type:INT64 value:"9" ` +
+			`_c3_0: type:INT64 value:"10" _c3_1: type:INT64 value:"11" _c3_2: type:INT64 value:"12" ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`sharded.-20: prefix mid2 suffix ` +
-			`{_c10: type:INT64 value:"4" _c11: type:INT64 value:"5" _c12: type:INT64 value:"6" ` +
-			`_c20: type:INT64 value:"7" _c21: type:INT64 value:"8" _c22: type:INT64 value:"9" ` +
-			`_c30: type:INT64 value:"10" _c31: type:INT64 value:"11" _c32: type:INT64 value:"12" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`{_c1_0: type:INT64 value:"4" _c1_1: type:INT64 value:"5" _c1_2: type:INT64 value:"6" ` +
+			`_c2_0: type:INT64 value:"7" _c2_1: type:INT64 value:"8" _c2_2: type:INT64 value:"9" ` +
+			`_c3_0: type:INT64 value:"10" _c3_1: type:INT64 value:"11" _c3_2: type:INT64 value:"12" ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`true false`,
 	})
 }
@@ -574,9 +612,10 @@ func TestInsertShardedOwnedWithNull(t *testing.T) {
 					"onecol": {
 						Type: "lookup",
 						Params: map[string]string{
-							"table": "lkp1",
-							"from":  "from",
-							"to":    "toc",
+							"table":        "lkp1",
+							"from":         "from",
+							"to":           "toc",
+							"ignore_nulls": "true",
 						},
 						Owner: "t1",
 					},
@@ -595,10 +634,7 @@ func TestInsertShardedOwnedWithNull(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -627,20 +663,17 @@ func TestInsertShardedOwnedWithNull(t *testing.T) {
 		" suffix",
 	)
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`Execute insert into lkp1(from, toc) values(:from0, :toc0) from0: toc0: type:VARBINARY ` +
-			`value:"\026k@\264J\272K\326"  true`,
-		`ResolveDestinations sharded [value:"0" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
+		`ResolveDestinations sharded [value:"0"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
 		`ExecuteMultiShard sharded.20-: prefix mid1 suffix ` +
-			`{_c30: _id0: type:INT64 value:"1" } true true`,
+			`{_c3_0:  _id_0: type:INT64 value:"1"} true true`,
 	})
 }
 
@@ -680,10 +713,7 @@ func TestInsertShardedGeo(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -723,25 +753,24 @@ func TestInsertShardedGeo(t *testing.T) {
 		" suffix",
 	)
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20"},
-	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20"}
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`Execute insert into id_idx(id, keyspace_id) values(:id0, :keyspace_id0), (:id1, :keyspace_id1) ` +
-			`id0: type:INT64 value:"1" id1: type:INT64 value:"1" ` +
-			`keyspace_id0: type:VARBINARY value:"\001\026k@\264J\272K\326" keyspace_id1: type:VARBINARY value:"\377\026k@\264J\272K\326"  true`,
-		`ResolveDestinations sharded [value:"0"  value:"1" ] Destinations:DestinationKeyspaceID(01166b40b44aba4bd6),DestinationKeyspaceID(ff166b40b44aba4bd6)`,
+		`Execute insert into id_idx(id, keyspace_id) values(:id_0, :keyspace_id_0), (:id_1, :keyspace_id_1) ` +
+			`id_0: type:INT64 value:"1" id_1: type:INT64 value:"1" ` +
+			`keyspace_id_0: type:VARBINARY value:"\x01\x16k@\xb4J\xbaK\xd6" keyspace_id_1: type:VARBINARY value:"\xff\x16k@\xb4J\xbaK\xd6" true`,
+		`ResolveDestinations sharded [value:"0" value:"1"] Destinations:DestinationKeyspaceID(01166b40b44aba4bd6),DestinationKeyspaceID(ff166b40b44aba4bd6)`,
 		`ExecuteMultiShard sharded.20-: prefix mid1 suffix ` +
-			`{_id0: type:INT64 value:"1" _id1: type:INT64 value:"1" ` +
-			`_region0: type:INT64 value:"1" _region1: type:INT64 value:"255" } ` +
+			`{_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"1" ` +
+			`_region_0: type:INT64 value:"1" _region_1: type:INT64 value:"255"} ` +
 			`sharded.-20: prefix mid2 suffix ` +
-			`{_id0: type:INT64 value:"1" _id1: type:INT64 value:"1" ` +
-			`_region0: type:INT64 value:"1" _region1: type:INT64 value:"255" } ` +
+			`{_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"1" ` +
+			`_region_0: type:INT64 value:"1" _region_1: type:INT64 value:"255"} ` +
 			`true false`,
 	})
 }
@@ -796,10 +825,7 @@ func TestInsertShardedIgnoreOwned(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -865,6 +891,15 @@ func TestInsertShardedIgnoreOwned(t *testing.T) {
 		" suffix",
 	)
 
+	ksid0Lookup := sqltypes.MakeTestResult(
+		sqltypes.MakeTestFields(
+			"from|to",
+			"int64|varbinary",
+		),
+		"1|\x00",
+		"3|\x00",
+		"4|\x00",
+	)
 	ksid0 := sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"to",
@@ -873,66 +908,59 @@ func TestInsertShardedIgnoreOwned(t *testing.T) {
 		"\x00",
 	)
 	noresult := &sqltypes.Result{}
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20"},
-		results: []*sqltypes.Result{
-			// primary vindex lookups: fail row 2.
-			ksid0,
-			noresult,
-			ksid0,
-			ksid0,
-			// insert lkp2
-			noresult,
-			// fail one verification (row 3)
-			ksid0,
-			noresult,
-			ksid0,
-			// insert lkp1
-			noresult,
-			// verify lkp1 (only two rows to verify)
-			ksid0,
-			ksid0,
-		},
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20"}
+	vc.results = []*sqltypes.Result{
+		// primary vindex lookups: fail row 2.
+		ksid0Lookup,
+		// insert lkp2
+		noresult,
+		// fail one verification (row 3)
+		ksid0,
+		noresult,
+		ksid0,
+		// insert lkp1
+		noresult,
+		// verify lkp1 (only two rows to verify)
+		ksid0,
+		ksid0,
 	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"1"  false`,
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"2"  false`,
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"3"  false`,
-		`Execute select toc from prim where from1 = :from1 from1: type:INT64 value:"4"  false`,
-		`Execute insert ignore into lkp2(from1, from2, toc) values(:from10, :from20, :toc0), (:from11, :from21, :toc1), (:from12, :from22, :toc2) ` +
-			`from10: type:INT64 value:"5" from11: type:INT64 value:"7" from12: type:INT64 value:"8" ` +
-			`from20: type:INT64 value:"9" from21: type:INT64 value:"11" from22: type:INT64 value:"12" ` +
-			`toc0: type:VARBINARY value:"\000" toc1: type:VARBINARY value:"\000" toc2: type:VARBINARY value:"\000"  ` +
+		`Execute select from1, toc from prim where from1 in ::from1 from1: type:TUPLE values:{type:INT64 value:"1"} values:{type:INT64 value:"2"} values:{type:INT64 value:"3"} values:{type:INT64 value:"4"} false`,
+		`Execute insert ignore into lkp2(from1, from2, toc) values(:from1_0, :from2_0, :toc_0), (:from1_1, :from2_1, :toc_1), (:from1_2, :from2_2, :toc_2) ` +
+			`from1_0: type:INT64 value:"5" from1_1: type:INT64 value:"7" from1_2: type:INT64 value:"8" ` +
+			`from2_0: type:INT64 value:"9" from2_1: type:INT64 value:"11" from2_2: type:INT64 value:"12" ` +
+			`toc_0: type:VARBINARY value:"\x00" toc_1: type:VARBINARY value:"\x00" toc_2: type:VARBINARY value:"\x00" ` +
 			`true`,
 		// row 2 is out because it didn't map to a ksid.
-		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"5" toc: type:VARBINARY value:"\000"  false`,
-		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"7" toc: type:VARBINARY value:"\000"  false`,
-		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"8" toc: type:VARBINARY value:"\000"  false`,
-		`Execute insert ignore into lkp1(from, toc) values(:from0, :toc0), (:from1, :toc1) ` +
-			`from0: type:INT64 value:"13" from1: type:INT64 value:"16" ` +
-			`toc0: type:VARBINARY value:"\000" toc1: type:VARBINARY value:"\000"  ` +
+		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"5" toc: type:VARBINARY value:"\x00" false`,
+		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"7" toc: type:VARBINARY value:"\x00" false`,
+		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"8" toc: type:VARBINARY value:"\x00" false`,
+		`Execute insert ignore into lkp1(from, toc) values(:from_0, :toc_0), (:from_1, :toc_1) ` +
+			`from_0: type:INT64 value:"13" from_1: type:INT64 value:"16" ` +
+			`toc_0: type:VARBINARY value:"\x00" toc_1: type:VARBINARY value:"\x00" ` +
 			`true`,
 		// row 3 is out because it failed Verify. Only two verifications from lkp1.
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"13" toc: type:VARBINARY value:"\000"  false`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"16" toc: type:VARBINARY value:"\000"  false`,
-		`ResolveDestinations sharded [value:"0"  value:"3" ] Destinations:DestinationKeyspaceID(00),DestinationKeyspaceID(00)`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"13" toc: type:VARBINARY value:"\x00" false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"16" toc: type:VARBINARY value:"\x00" false`,
+		`ResolveDestinations sharded [value:"0" value:"3"] Destinations:DestinationKeyspaceID(00),DestinationKeyspaceID(00)`,
 		// Bind vars for rows 2 & 3 may be missing because they were not sent.
 		`ExecuteMultiShard ` +
 			`sharded.20-: prefix mid1 suffix ` +
-			`{_c10: type:INT64 value:"5" _c13: type:INT64 value:"8" ` +
-			`_c20: type:INT64 value:"9" _c23: type:INT64 value:"12" ` +
-			`_c30: type:INT64 value:"13" _c33: type:INT64 value:"16" ` +
-			`_id0: type:INT64 value:"1" _id3: type:INT64 value:"4" } ` +
+			`{_c1_0: type:INT64 value:"5" _c1_3: type:INT64 value:"8" ` +
+			`_c2_0: type:INT64 value:"9" _c2_3: type:INT64 value:"12" ` +
+			`_c3_0: type:INT64 value:"13" _c3_3: type:INT64 value:"16" ` +
+			`_id_0: type:INT64 value:"1" _id_3: type:INT64 value:"4"} ` +
 			`sharded.-20: prefix mid4 suffix ` +
-			`{_c10: type:INT64 value:"5" _c13: type:INT64 value:"8" ` +
-			`_c20: type:INT64 value:"9" _c23: type:INT64 value:"12" ` +
-			`_c30: type:INT64 value:"13" _c33: type:INT64 value:"16" ` +
-			`_id0: type:INT64 value:"1" _id3: type:INT64 value:"4" } ` +
+			`{_c1_0: type:INT64 value:"5" _c1_3: type:INT64 value:"8" ` +
+			`_c2_0: type:INT64 value:"9" _c2_3: type:INT64 value:"12" ` +
+			`_c3_0: type:INT64 value:"13" _c3_3: type:INT64 value:"16" ` +
+			`_id_0: type:INT64 value:"1" _id_3: type:INT64 value:"4"} ` +
 			`true false`,
 	})
 }
@@ -949,9 +977,10 @@ func TestInsertShardedIgnoreOwnedWithNull(t *testing.T) {
 					"onecol": {
 						Type: "lookup",
 						Params: map[string]string{
-							"table": "lkp1",
-							"from":  "from",
-							"to":    "toc",
+							"table":        "lkp1",
+							"from":         "from",
+							"to":           "toc",
+							"ignore_nulls": "true",
 						},
 						Owner: "t1",
 					},
@@ -970,10 +999,7 @@ func TestInsertShardedIgnoreOwnedWithNull(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -1009,26 +1035,23 @@ func TestInsertShardedIgnoreOwnedWithNull(t *testing.T) {
 		),
 		"\x00",
 	)
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"-20", "20-"},
-		results: []*sqltypes.Result{
-			ksid0,
-			ksid0,
-			ksid0,
-		},
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"-20", "20-"}
+	vc.results = []*sqltypes.Result{
+		ksid0,
+		ksid0,
+		ksid0,
 	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`Execute insert ignore into lkp1(from, toc) values(:from0, :toc0) from0: toc0: type:VARBINARY ` +
-			`value:"\026k@\264J\272K\326"  true`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: toc: type:VARBINARY value:"\026k@\264J\272K\326"  false`,
-		`ResolveDestinations sharded [value:"0" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from:  toc: type:VARBINARY value:"\x16k@\xb4J\xbaK\xd6" false`,
+		`ResolveDestinations sharded [value:"0"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6)`,
 		`ExecuteMultiShard sharded.-20: prefix mid1 suffix ` +
-			`{_c30: _id0: type:INT64 value:"1" } true true`,
+			`{_c3_0:  _id_0: type:INT64 value:"1"} true true`,
 	})
 }
 
@@ -1075,10 +1098,7 @@ func TestInsertShardedUnownedVerify(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -1145,44 +1165,42 @@ func TestInsertShardedUnownedVerify(t *testing.T) {
 		"1",
 	)
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-		results: []*sqltypes.Result{
-			nonemptyResult,
-			nonemptyResult,
-			nonemptyResult,
-			nonemptyResult,
-			nonemptyResult,
-			nonemptyResult,
-		},
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+	vc.results = []*sqltypes.Result{
+		nonemptyResult,
+		nonemptyResult,
+		nonemptyResult,
+		nonemptyResult,
+		nonemptyResult,
+		nonemptyResult,
 	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
 		// Perform verification for each colvindex.
 		// Note that only first column of each colvindex is used.
-		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"4" toc: type:VARBINARY value:"\026k@\264J\272K\326"  false`,
-		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"5" toc: type:VARBINARY value:"\006\347\352\"\316\222p\217"  false`,
-		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"6" toc: type:VARBINARY value:"N\261\220\311\242\372\026\234"  false`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"10" toc: type:VARBINARY value:"\026k@\264J\272K\326"  false`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"11" toc: type:VARBINARY value:"\006\347\352\"\316\222p\217"  false`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"12" toc: type:VARBINARY value:"N\261\220\311\242\372\026\234"  false`,
+		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"4" toc: type:VARBINARY value:"\x16k@\xb4J\xbaK\xd6" false`,
+		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"5" toc: type:VARBINARY value:"\x06\xe7\xea\"Βp\x8f" false`,
+		`Execute select from1 from lkp2 where from1 = :from1 and toc = :toc from1: type:INT64 value:"6" toc: type:VARBINARY value:"N\xb1\x90ɢ\xfa\x16\x9c" false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"10" toc: type:VARBINARY value:"\x16k@\xb4J\xbaK\xd6" false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"11" toc: type:VARBINARY value:"\x06\xe7\xea\"Βp\x8f" false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"12" toc: type:VARBINARY value:"N\xb1\x90ɢ\xfa\x16\x9c" false`,
 		// Based on shardForKsid, values returned will be 20-, -20, 20-.
-		`ResolveDestinations sharded [value:"0"  value:"1"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"1" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		`ExecuteMultiShard ` +
 			`sharded.20-: prefix mid1, mid3 suffix ` +
-			`{_c10: type:INT64 value:"4" _c11: type:INT64 value:"5" _c12: type:INT64 value:"6" ` +
-			`_c20: type:INT64 value:"7" _c21: type:INT64 value:"8" _c22: type:INT64 value:"9" ` +
-			`_c30: type:INT64 value:"10" _c31: type:INT64 value:"11" _c32: type:INT64 value:"12" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`{_c1_0: type:INT64 value:"4" _c1_1: type:INT64 value:"5" _c1_2: type:INT64 value:"6" ` +
+			`_c2_0: type:INT64 value:"7" _c2_1: type:INT64 value:"8" _c2_2: type:INT64 value:"9" ` +
+			`_c3_0: type:INT64 value:"10" _c3_1: type:INT64 value:"11" _c3_2: type:INT64 value:"12" ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`sharded.-20: prefix mid2 suffix ` +
-			`{_c10: type:INT64 value:"4" _c11: type:INT64 value:"5" _c12: type:INT64 value:"6" ` +
-			`_c20: type:INT64 value:"7" _c21: type:INT64 value:"8" _c22: type:INT64 value:"9" ` +
-			`_c30: type:INT64 value:"10" _c31: type:INT64 value:"11" _c32: type:INT64 value:"12" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`{_c1_0: type:INT64 value:"4" _c1_1: type:INT64 value:"5" _c1_2: type:INT64 value:"6" ` +
+			`_c2_0: type:INT64 value:"7" _c2_1: type:INT64 value:"8" _c2_2: type:INT64 value:"9" ` +
+			`_c3_0: type:INT64 value:"10" _c3_1: type:INT64 value:"11" _c3_2: type:INT64 value:"12" ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`true false`,
 	})
 }
@@ -1219,10 +1237,7 @@ func TestInsertShardedIgnoreUnownedVerify(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -1268,35 +1283,33 @@ func TestInsertShardedIgnoreUnownedVerify(t *testing.T) {
 		"1",
 	)
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20"},
-		results: []*sqltypes.Result{
-			nonemptyResult,
-			// fail verification of second row.
-			{},
-			nonemptyResult,
-		},
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20"}
+	vc.results = []*sqltypes.Result{
+		nonemptyResult,
+		// fail verification of second row.
+		{},
+		nonemptyResult,
 	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
 		// Perform verification for each colvindex.
 		// Note that only first column of each colvindex is used.
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"10" toc: type:VARBINARY value:"\026k@\264J\272K\326"  false`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"11" toc: type:VARBINARY value:"\006\347\352\"\316\222p\217"  false`,
-		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"12" toc: type:VARBINARY value:"N\261\220\311\242\372\026\234"  false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"10" toc: type:VARBINARY value:"\x16k@\xb4J\xbaK\xd6" false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"11" toc: type:VARBINARY value:"\x06\xe7\xea\"Βp\x8f" false`,
+		`Execute select from from lkp1 where from = :from and toc = :toc from: type:INT64 value:"12" toc: type:VARBINARY value:"N\xb1\x90ɢ\xfa\x16\x9c" false`,
 		// Based on shardForKsid, values returned will be 20-, -20.
-		`ResolveDestinations sharded [value:"0"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		`ExecuteMultiShard ` +
 			`sharded.20-: prefix mid1 suffix ` +
-			`{_c30: type:INT64 value:"10" _c32: type:INT64 value:"12" ` +
-			`_id0: type:INT64 value:"1" _id2: type:INT64 value:"3" } ` +
+			`{_c3_0: type:INT64 value:"10" _c3_2: type:INT64 value:"12" ` +
+			`_id_0: type:INT64 value:"1" _id_2: type:INT64 value:"3"} ` +
 			`sharded.-20: prefix mid3 suffix ` +
-			`{_c30: type:INT64 value:"10" _c32: type:INT64 value:"12" ` +
-			`_id0: type:INT64 value:"1" _id2: type:INT64 value:"3" } ` +
+			`{_c3_0: type:INT64 value:"10" _c3_2: type:INT64 value:"12" ` +
+			`_id_0: type:INT64 value:"1" _id_2: type:INT64 value:"3"} ` +
 			`true false`,
 	})
 }
@@ -1333,10 +1346,7 @@ func TestInsertShardedIgnoreUnownedVerifyFail(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -1365,11 +1375,10 @@ func TestInsertShardedIgnoreUnownedVerifyFail(t *testing.T) {
 		" suffix",
 	)
 
-	vc := &loggingVCursor{
-		shards: []string{"-20", "20-"},
-	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertSharded: getInsertShardedRoute: values [[INT64(2)]] for column [c3] does not map to keyspace ids")
+	vc := newDMLTestVCursor("-20", "20-")
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	require.EqualError(t, err, `values [[INT64(2)]] for column [c3] does not map to keyspace ids`)
 }
 
 func TestInsertShardedUnownedReverseMap(t *testing.T) {
@@ -1415,10 +1424,7 @@ func TestInsertShardedUnownedReverseMap(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -1485,30 +1491,29 @@ func TestInsertShardedUnownedReverseMap(t *testing.T) {
 		"1",
 	)
 
-	vc := &loggingVCursor{
-		shards:       []string{"-20", "20-"},
-		shardForKsid: []string{"20-", "-20", "20-"},
-		results: []*sqltypes.Result{
-			nonemptyResult,
-		},
+	vc := newDMLTestVCursor("-20", "20-")
+	vc.shardForKsid = []string{"20-", "-20", "20-"}
+	vc.results = []*sqltypes.Result{
+		nonemptyResult,
 	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vc.ExpectLog(t, []string{
-		`ResolveDestinations sharded [value:"0"  value:"1"  value:"2" ] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
+		`ResolveDestinations sharded [value:"0" value:"1" value:"2"] Destinations:DestinationKeyspaceID(166b40b44aba4bd6),DestinationKeyspaceID(06e7ea22ce92708f),DestinationKeyspaceID(4eb190c9a2fa169c)`,
 		`ExecuteMultiShard ` +
 			`sharded.20-: prefix mid1, mid3 suffix ` +
-			`{_c10: type:UINT64 value:"1" _c11: type:UINT64 value:"2" _c12: type:UINT64 value:"3" ` +
-			`_c20: _c21: _c22: ` +
-			`_c30: type:UINT64 value:"1" _c31: type:UINT64 value:"2" _c32: type:UINT64 value:"3" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`{_c1_0: type:UINT64 value:"1" _c1_1: type:UINT64 value:"2" _c1_2: type:UINT64 value:"3" ` +
+			`_c2_0:  _c2_1:  _c2_2:  ` +
+			`_c3_0: type:UINT64 value:"1" _c3_1: type:UINT64 value:"2" _c3_2: type:UINT64 value:"3" ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`sharded.-20: prefix mid2 suffix ` +
-			`{_c10: type:UINT64 value:"1" _c11: type:UINT64 value:"2" _c12: type:UINT64 value:"3" ` +
-			`_c20: _c21: _c22: ` +
-			`_c30: type:UINT64 value:"1" _c31: type:UINT64 value:"2" _c32: type:UINT64 value:"3" ` +
-			`_id0: type:INT64 value:"1" _id1: type:INT64 value:"2" _id2: type:INT64 value:"3" } ` +
+			`{_c1_0: type:UINT64 value:"1" _c1_1: type:UINT64 value:"2" _c1_2: type:UINT64 value:"3" ` +
+			`_c2_0:  _c2_1:  _c2_2:  ` +
+			`_c3_0: type:UINT64 value:"1" _c3_1: type:UINT64 value:"2" _c3_2: type:UINT64 value:"3" ` +
+			`_id_0: type:INT64 value:"1" _id_1: type:INT64 value:"2" _id_2: type:INT64 value:"3"} ` +
 			`true false`,
 	})
 }
@@ -1545,10 +1550,7 @@ func TestInsertShardedUnownedReverseMapFail(t *testing.T) {
 			},
 		},
 	}
-	vs, err := vindexes.BuildVSchema(invschema)
-	if err != nil {
-		t.Fatal(err)
-	}
+	vs := vindexes.BuildVSchema(invschema)
 	ks := vs.Keyspaces["sharded"]
 
 	ins := NewInsert(
@@ -1577,9 +1579,8 @@ func TestInsertShardedUnownedReverseMapFail(t *testing.T) {
 		" suffix",
 	)
 
-	vc := &loggingVCursor{
-		shards: []string{"-20", "20-"},
-	}
-	_, err = ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
-	expectError(t, "Execute", err, "execInsertSharded: getInsertShardedRoute: value must be supplied for column [c3]")
+	vc := newDMLTestVCursor("-20", "20-")
+
+	_, err := ins.Execute(vc, map[string]*querypb.BindVariable{}, false)
+	require.EqualError(t, err, `value must be supplied for column [c3]`)
 }

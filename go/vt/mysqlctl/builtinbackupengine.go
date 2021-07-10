@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,8 @@ import (
 	"time"
 
 	"github.com/klauspost/pgzip"
+	"github.com/planetscale/pargzip"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/concurrency"
@@ -45,6 +48,13 @@ const (
 	builtinBackupEngineName = "builtin"
 	writerBufferSize        = 2 * 1024 * 1024
 	dataDictionaryFile      = "mysql.ibd"
+)
+
+var (
+	// BuiltinBackupMysqldTimeout is how long ExecuteBackup should wait for response from mysqld.Shutdown.
+	// It can later be extended for other calls to mysqld during backup functions.
+	// Exported for testing.
+	BuiltinBackupMysqldTimeout = flag.Duration("builtinbackup_mysqld_timeout", 10*time.Minute, "how long to wait for mysqld to shutdown at the start of the backup")
 )
 
 // BuiltinBackupEngine encapsulates the logic of the builtin engine
@@ -131,23 +141,23 @@ func (be *BuiltinBackupEngine) ExecuteBackup(ctx context.Context, params BackupP
 	params.Logger.Infof("Hook: %v, Compress: %v", *backupStorageHook, *backupStorageCompress)
 
 	// Save initial state so we can restore.
-	slaveStartRequired := false
-	sourceIsMaster := false
-	readOnly := true
+	replicaStartRequired := false
+	sourceIsPrimary := false
+	readOnly := true //nolint
 	var replicationPosition mysql.Position
-	semiSyncMaster, semiSyncSlave := params.Mysqld.SemiSyncEnabled()
+	semiSyncSource, semiSyncReplica := params.Mysqld.SemiSyncEnabled()
 
 	// See if we need to restart replication after backup.
 	params.Logger.Infof("getting current replication status")
-	slaveStatus, err := params.Mysqld.SlaveStatus()
+	replicaStatus, err := params.Mysqld.ReplicationStatus()
 	switch err {
 	case nil:
-		slaveStartRequired = slaveStatus.SlaveRunning()
-	case mysql.ErrNotSlave:
-		// keep going if we're the master, might be a degenerate case
-		sourceIsMaster = true
+		replicaStartRequired = replicaStatus.ReplicationRunning() && !*DisableActiveReparents
+	case mysql.ErrNotReplica:
+		// keep going if we're the primary, might be a degenerate case
+		sourceIsPrimary = true
 	default:
-		return false, vterrors.Wrap(err, "can't get slave status")
+		return false, vterrors.Wrap(err, "can't get replica status")
 	}
 
 	// get the read-only flag
@@ -157,32 +167,34 @@ func (be *BuiltinBackupEngine) ExecuteBackup(ctx context.Context, params BackupP
 	}
 
 	// get the replication position
-	if sourceIsMaster {
+	if sourceIsPrimary {
 		if !readOnly {
-			params.Logger.Infof("turning master read-only before backup")
+			params.Logger.Infof("turning primary read-only before backup")
 			if err = params.Mysqld.SetReadOnly(true); err != nil {
 				return false, vterrors.Wrap(err, "can't set read-only status")
 			}
 		}
-		replicationPosition, err = params.Mysqld.MasterPosition()
+		replicationPosition, err = params.Mysqld.PrimaryPosition()
 		if err != nil {
-			return false, vterrors.Wrap(err, "can't get master position")
+			return false, vterrors.Wrap(err, "can't get position on primary")
 		}
 	} else {
-		if err = params.Mysqld.StopSlave(params.HookExtraEnv); err != nil {
-			return false, vterrors.Wrapf(err, "can't stop slave")
+		if err = params.Mysqld.StopReplication(params.HookExtraEnv); err != nil {
+			return false, vterrors.Wrapf(err, "can't stop replica")
 		}
-		var slaveStatus mysql.SlaveStatus
-		slaveStatus, err = params.Mysqld.SlaveStatus()
+		var replicaStatus mysql.ReplicationStatus
+		replicaStatus, err = params.Mysqld.ReplicationStatus()
 		if err != nil {
-			return false, vterrors.Wrap(err, "can't get slave status")
+			return false, vterrors.Wrap(err, "can't get replica status")
 		}
-		replicationPosition = slaveStatus.Position
+		replicationPosition = replicaStatus.Position
 	}
 	params.Logger.Infof("using replication position: %v", replicationPosition)
 
 	// shutdown mysqld
-	err = params.Mysqld.Shutdown(ctx, params.Cnf, true)
+	shutdownCtx, cancel := context.WithTimeout(ctx, *BuiltinBackupMysqldTimeout)
+	err = params.Mysqld.Shutdown(shutdownCtx, params.Cnf, true)
+	defer cancel()
 	if err != nil {
 		return false, vterrors.Wrap(err, "can't shutdown mysqld")
 	}
@@ -204,32 +216,32 @@ func (be *BuiltinBackupEngine) ExecuteBackup(ctx context.Context, params BackupP
 	}
 
 	// Restore original mysqld state that we saved above.
-	if semiSyncMaster || semiSyncSlave {
+	if semiSyncSource || semiSyncReplica {
 		// Only do this if one of them was on, since both being off could mean
 		// the plugin isn't even loaded, and the server variables don't exist.
-		params.Logger.Infof("restoring semi-sync settings from before backup: master=%v, slave=%v",
-			semiSyncMaster, semiSyncSlave)
-		err := params.Mysqld.SetSemiSyncEnabled(semiSyncMaster, semiSyncSlave)
+		params.Logger.Infof("restoring semi-sync settings from before backup: master=%v, replica=%v",
+			semiSyncSource, semiSyncReplica)
+		err := params.Mysqld.SetSemiSyncEnabled(semiSyncSource, semiSyncReplica)
 		if err != nil {
 			return usable, err
 		}
 	}
-	if slaveStartRequired {
+	if replicaStartRequired {
 		params.Logger.Infof("restarting mysql replication")
-		if err := params.Mysqld.StartSlave(params.HookExtraEnv); err != nil {
-			return usable, vterrors.Wrap(err, "cannot restart slave")
+		if err := params.Mysqld.StartReplication(params.HookExtraEnv); err != nil {
+			return usable, vterrors.Wrap(err, "cannot restart replica")
 		}
 
 		// this should be quick, but we might as well just wait
-		if err := WaitForSlaveStart(params.Mysqld, slaveStartDeadline); err != nil {
-			return usable, vterrors.Wrap(err, "slave is not restarting")
+		if err := WaitForReplicationStart(params.Mysqld, replicationStartDeadline); err != nil {
+			return usable, vterrors.Wrap(err, "replica is not restarting")
 		}
 
-		// Wait for a reliable value for SecondsBehindMaster from SlaveStatus()
+		// Wait for a reliable value for SecondsBehindMaster from ReplicationStatus()
 
 		// We know that we stopped at replicationPosition.
-		// If MasterPosition is the same, that means no writes
-		// have happened to master, so we are up-to-date.
+		// If PrimaryPosition is the same, that means no writes
+		// have happened to primary, so we are up-to-date.
 		// Otherwise, we wait for replica's Position to change from
 		// the saved replicationPosition before proceeding
 		tmc := tmclient.NewTabletManagerClient()
@@ -237,17 +249,17 @@ func (be *BuiltinBackupEngine) ExecuteBackup(ctx context.Context, params BackupP
 		remoteCtx, remoteCancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
 		defer remoteCancel()
 
-		masterPos, err := getMasterPosition(remoteCtx, tmc, params.TopoServer, params.Keyspace, params.Shard)
-		// If we are unable to get master position, return error.
+		pos, err := getPrimaryPosition(remoteCtx, tmc, params.TopoServer, params.Keyspace, params.Shard)
+		// If we are unable to get the primary's position, return error.
 		if err != nil {
 			return usable, err
 		}
-		if !replicationPosition.Equal(masterPos) {
+		if !replicationPosition.Equal(pos) {
 			for {
 				if err := ctx.Err(); err != nil {
 					return usable, err
 				}
-				status, err := params.Mysqld.SlaveStatus()
+				status, err := params.Mysqld.ReplicationStatus()
 				if err != nil {
 					return usable, err
 				}
@@ -276,7 +288,6 @@ func (be *BuiltinBackupEngine) backupFiles(ctx context.Context, params BackupPar
 
 	// Backup with the provided concurrency.
 	sema := sync2.NewSemaphore(params.Concurrency, 0)
-	rec := concurrency.AllErrorRecorder{}
 	wg := sync.WaitGroup{}
 	for i := range fes {
 		wg.Add(1)
@@ -287,19 +298,28 @@ func (be *BuiltinBackupEngine) backupFiles(ctx context.Context, params BackupPar
 			// encountered an error.
 			sema.Acquire()
 			defer sema.Release()
-			if rec.HasErrors() {
+			if bh.HasErrors() {
 				return
 			}
 
 			// Backup the individual file.
 			name := fmt.Sprintf("%v", i)
-			rec.RecordError(be.backupFile(ctx, params, bh, &fes[i], name))
+			bh.RecordError(be.backupFile(ctx, params, bh, &fes[i], name))
 		}(i)
 	}
 
 	wg.Wait()
-	if rec.HasErrors() {
-		return rec.Error()
+
+	// BackupHandle supports the ErrorRecorder interface for tracking errors
+	// across any goroutines that fan out to take the backup. This means that we
+	// don't need a local error recorder and can put everything through the bh.
+	//
+	// This handles the scenario where bh.AddFile() encounters an error asynchronously,
+	// which ordinarily would be lost in the context of `be.backupFile`, i.e. if an
+	// error were encountered
+	// [here](https://github.com/vitessio/vitess/blob/d26b6c7975b12a87364e471e2e2dfa4e253c2a5b/go/vt/mysqlctl/s3backupstorage/s3.go#L139-L142).
+	if bh.HasErrors() {
+		return bh.Error()
 	}
 
 	// open the MANIFEST
@@ -389,13 +409,12 @@ func (be *BuiltinBackupEngine) backupFile(ctx context.Context, params BackupPara
 	}
 
 	// Create the gzip compression pipe, if necessary.
-	var gzip *pgzip.Writer
+	var gzip *pargzip.Writer
 	if *backupStorageCompress {
-		gzip, err = pgzip.NewWriterLevel(writer, pgzip.BestSpeed)
-		if err != nil {
-			return vterrors.Wrap(err, "cannot create gziper")
-		}
-		gzip.SetConcurrency(*backupCompressBlockSize, *backupCompressBlocks)
+		gzip = pargzip.NewWriter(writer)
+		gzip.ChunkSize = *backupCompressBlockSize
+		gzip.Parallel = *backupCompressBlocks
+		gzip.CompressionLevel = pargzip.BestSpeed
 		writer = gzip
 	}
 
@@ -602,7 +621,7 @@ func (be *BuiltinBackupEngine) ShouldDrainForBackup() bool {
 	return true
 }
 
-func getMasterPosition(ctx context.Context, tmc tmclient.TabletManagerClient, ts *topo.Server, keyspace, shard string) (mysql.Position, error) {
+func getPrimaryPosition(ctx context.Context, tmc tmclient.TabletManagerClient, ts *topo.Server, keyspace, shard string) (mysql.Position, error) {
 	si, err := ts.GetShard(ctx, keyspace, shard)
 	if err != nil {
 		return mysql.Position{}, vterrors.Wrap(err, "can't read shard")

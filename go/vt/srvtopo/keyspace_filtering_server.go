@@ -19,7 +19,7 @@ package srvtopo
 import (
 	"fmt"
 
-	"golang.org/x/net/context"
+	"context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -72,8 +72,9 @@ func (ksf keyspaceFilteringServer) GetTopoServer() (*topo.Server, error) {
 func (ksf keyspaceFilteringServer) GetSrvKeyspaceNames(
 	ctx context.Context,
 	cell string,
+	staleOK bool,
 ) ([]string, error) {
-	keyspaces, err := ksf.server.GetSrvKeyspaceNames(ctx, cell)
+	keyspaces, err := ksf.server.GetSrvKeyspaceNames(ctx, cell, staleOK)
 	ret := make([]string, 0, len(keyspaces))
 	for _, ks := range keyspaces {
 		if ksf.selectKeyspaces[ks] {

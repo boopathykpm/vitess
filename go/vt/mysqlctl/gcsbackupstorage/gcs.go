@@ -26,13 +26,15 @@ import (
 	"strings"
 	"sync"
 
+	"context"
+
 	"cloud.google.com/go/storage"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
 	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
 )
 
@@ -51,6 +53,22 @@ type GCSBackupHandle struct {
 	dir      string
 	name     string
 	readOnly bool
+	errors   concurrency.AllErrorRecorder
+}
+
+// RecordError is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) RecordError(err error) {
+	bh.errors.RecordError(err)
+}
+
+// HasErrors is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) HasErrors() bool {
+	return bh.errors.HasErrors()
+}
+
+// Error is part of the concurrency.ErrorRecorder interface.
+func (bh *GCSBackupHandle) Error() error {
+	return bh.errors.Error()
 }
 
 // Directory implements BackupHandle.
@@ -115,7 +133,14 @@ func (bs *GCSBackupStorage) ListBackups(ctx context.Context, dir string) ([]back
 
 	// List prefixes that begin with dir (i.e. list subdirs).
 	var subdirs []string
-	searchPrefix := objName(dir, "" /* include trailing slash */)
+
+	var searchPrefix string
+	if dir == "/" {
+		searchPrefix = ""
+	} else {
+		searchPrefix = objName(dir, "" /* include trailing slash */)
+	}
+
 	query := &storage.Query{
 		Delimiter: "/",
 		Prefix:    searchPrefix,

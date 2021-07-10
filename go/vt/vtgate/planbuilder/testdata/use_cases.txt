@@ -5,10 +5,10 @@
   "Original": "use ks",
   "Instructions": {
     "OperatorType": "UpdateTarget",
-    "Variant": "",
     "target": "ks"
   }
 }
+Gen4 plan same as above
 
 # use db tablet
 "use ks@replica"
@@ -17,10 +17,10 @@
   "Original": "use ks@replica",
   "Instructions": {
     "OperatorType": "UpdateTarget",
-    "Variant": "",
     "target": "ks@replica"
   }
 }
+Gen4 plan same as above
 
 # use db target with :
 "use `ks:-80@replica`"
@@ -29,10 +29,10 @@
   "Original": "use `ks:-80@replica`",
   "Instructions": {
     "OperatorType": "UpdateTarget",
-    "Variant": "",
     "target": "ks:-80@replica"
   }
 }
+Gen4 plan same as above
 
 # use db target with /
 "use `ks/80-@replica`"
@@ -41,10 +41,10 @@
   "Original": "use `ks/80-@replica`",
   "Instructions": {
     "OperatorType": "UpdateTarget",
-    "Variant": "",
     "target": "ks/80-@replica"
   }
 }
+Gen4 plan same as above
 
 # reset db
 "use"
@@ -52,7 +52,7 @@
   "QueryType": "USE",
   "Original": "use",
   "Instructions": {
-    "OperatorType": "UpdateTarget",
-    "Variant": ""
+    "OperatorType": "UpdateTarget"
   }
 }
+Gen4 plan same as above

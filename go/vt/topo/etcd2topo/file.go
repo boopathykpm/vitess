@@ -19,8 +19,9 @@ package etcd2topo
 import (
 	"path"
 
-	"github.com/coreos/etcd/clientv3"
-	"golang.org/x/net/context"
+	"context"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"vitess.io/vitess/go/vt/topo"
 )

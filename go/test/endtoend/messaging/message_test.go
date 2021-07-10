@@ -26,8 +26,13 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/test/utils"
+
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/endtoend/cluster"
@@ -67,6 +72,8 @@ func TestMessage(t *testing.T) {
 
 	exec(t, conn, fmt.Sprintf("use %s", lookupKeyspace))
 	exec(t, conn, createMessage)
+	clusterInstance.VtctlProcess.ExecuteCommand(fmt.Sprintf("ReloadSchemaKeyspace %s", lookupKeyspace))
+
 	defer exec(t, conn, "drop table vitess_message")
 
 	exec(t, streamConn, "set workload = 'olap'")
@@ -89,51 +96,57 @@ func TestMessage(t *testing.T) {
 		}
 	}
 	require.NoError(t, err)
-	assert.Equal(t, wantFields, gotFields)
+	utils.MustMatch(t, wantFields, gotFields)
 
 	exec(t, conn, "insert into vitess_message(id, message) values(1, 'hello world')")
 
+	// account for jitter in timings, maxJitter uses the current hardcoded value for jitter in message_manager.go
+	jitter := int64(0)
+	maxJitter := int64(1.4 * 1e9)
+
 	// Consume first message.
 	start := time.Now().UnixNano()
-	got, err := streamConn.FetchNext()
+	got, err := streamConn.FetchNext(nil)
 	require.NoError(t, err)
 
 	want := []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewVarChar("hello world"),
 	}
-	assert.Equal(t, want, got)
+	utils.MustMatch(t, want, got)
 
 	qr := exec(t, conn, "select time_next, epoch from vitess_message where id = 1")
 	next, epoch := getTimeEpoch(qr)
+	jitter += epoch * maxJitter
 	// epoch could be 0 or 1, depending on how fast the row is updated
 	switch epoch {
 	case 0:
-		if !(start-1e9 < next && next < start) {
-			t.Errorf("next: %d. must be within 1s of start: %d", next/1e9, start/1e9)
+		if !(start-1e9 < next && next < (start+jitter)) {
+			t.Errorf("next: %d. must be within 1s of start: %d", next/1e9, (start+jitter)/1e9)
 		}
 	case 1:
-		if !(start < next && next < start+3e9) {
-			t.Errorf("next: %d. must be about 1s after start: %d", next/1e9, start/1e9)
+		if !(start < next && next < (start+jitter)+3e9) {
+			t.Errorf("next: %d. must be about 1s after start: %d", next/1e9, (start+jitter)/1e9)
 		}
 	default:
 		t.Errorf("epoch: %d, must be 0 or 1", epoch)
 	}
 
 	// Consume the resend.
-	_, err = streamConn.FetchNext()
+	_, err = streamConn.FetchNext(nil)
 	require.NoError(t, err)
 	qr = exec(t, conn, "select time_next, epoch from vitess_message where id = 1")
 	next, epoch = getTimeEpoch(qr)
+	jitter += epoch * maxJitter
 	// epoch could be 1 or 2, depending on how fast the row is updated
 	switch epoch {
 	case 1:
-		if !(start < next && next < start+3e9) {
-			t.Errorf("next: %d. must be about 1s after start: %d", next/1e9, start/1e9)
+		if !(start < next && next < (start+jitter)+3e9) {
+			t.Errorf("next: %d. must be about 1s after start: %d", next/1e9, (start+jitter)/1e9)
 		}
 	case 2:
-		if !(start+2e9 < next && next < start+6e9) {
-			t.Errorf("next: %d. must be about 3s after start: %d", next/1e9, start/1e9)
+		if !(start+2e9 < next && next < (start+jitter)+6e9) {
+			t.Errorf("next: %d. must be about 3s after start: %d", next/1e9, (start+jitter)/1e9)
 		}
 	default:
 		t.Errorf("epoch: %d, must be 1 or 2", epoch)
@@ -204,18 +217,18 @@ func TestThreeColMessage(t *testing.T) {
 		}
 	}
 	require.NoError(t, err)
-	assert.Equal(t, wantFields, gotFields)
+	utils.MustMatch(t, wantFields, gotFields)
 
 	exec(t, conn, "insert into vitess_message3(id, msg1, msg2) values(1, 'hello world', 3)")
 
-	got, err := streamConn.FetchNext()
+	got, err := streamConn.FetchNext(nil)
 	require.NoError(t, err)
 	want := []sqltypes.Value{
 		sqltypes.NewInt64(1),
 		sqltypes.NewVarChar("hello world"),
 		sqltypes.NewInt64(3),
 	}
-	assert.Equal(t, want, got)
+	utils.MustMatch(t, want, got)
 
 	// Verify Ack.
 	qr := exec(t, conn, "update vitess_message3 set time_acked = 123, time_next = null where id = 1 and time_acked is null")
@@ -226,8 +239,8 @@ func getTimeEpoch(qr *sqltypes.Result) (int64, int64) {
 	if len(qr.Rows) != 1 {
 		return 0, 0
 	}
-	t, _ := sqltypes.ToInt64(qr.Rows[0][0])
-	e, _ := sqltypes.ToInt64(qr.Rows[0][1])
+	t, _ := evalengine.ToInt64(qr.Rows[0][0])
+	e, _ := evalengine.ToInt64(qr.Rows[0][1])
 	return t, e
 }
 
@@ -321,6 +334,7 @@ func TestConnection(t *testing.T) {
 	_, err = stream.MessageStream(userKeyspace, "", nil, name)
 	require.Nil(t, err)
 	// validate client count of vttablet
+	time.Sleep(time.Second)
 	assert.Equal(t, 1, getClientCount(shard0Master))
 	assert.Equal(t, 1, getClientCount(shard1Master))
 	// second connection with vtgate, secont connection
@@ -330,6 +344,7 @@ func TestConnection(t *testing.T) {
 	_, err = stream1.MessageStream(userKeyspace, "", nil, name)
 	require.Nil(t, err)
 	// validate client count of vttablet
+	time.Sleep(time.Second)
 	assert.Equal(t, 2, getClientCount(shard0Master))
 	assert.Equal(t, 2, getClientCount(shard1Master))
 

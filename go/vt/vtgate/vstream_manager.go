@@ -17,12 +17,16 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
@@ -63,6 +67,31 @@ type vstream struct {
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// this flag is set by the client, default false
+	// if true skew detection is enabled and we align the streams so that they receive events from
+	// about the same time as each other. Note that there is no exact ordering of events across shards
+	minimizeSkew bool
+
+	// mutex used to synchronize access to skew detection parameters
+	skewMu sync.Mutex
+	// channel is created whenever there is a skew detected. closing it implies the current skew has been fixed
+	skewCh chan bool
+	// if a skew lasts for this long, we timeout the vstream call. currently hardcoded
+	skewTimeoutSeconds int64
+	// the slow streamId which is causing the skew. streamId is of the form <keyspace>.<shard>
+	laggard string
+	// transaction timestamp of the slowest stream
+	lowestTS int64
+	// the timestamp of the most recent event, keyed by streamId. streamId is of the form <keyspace>.<shard>
+	timestamps map[string]int64
+
+	vsm *vstreamManager
+
+	rss []*srvtopo.ResolvedShard
+
+	eventCh           chan []*binlogdatapb.VEvent
+	heartbeatInterval uint32
 }
 
 type journalEvent struct {
@@ -79,24 +108,33 @@ func newVStreamManager(resolver *srvtopo.Resolver, serv srvtopo.Server, cell str
 	}
 }
 
-func (vsm *vstreamManager) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, send func(events []*binlogdatapb.VEvent) error) error {
-	vgtid, filter, err := vsm.resolveParams(ctx, tabletType, vgtid, filter)
+func (vsm *vstreamManager) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid,
+	filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags, send func(events []*binlogdatapb.VEvent) error) error {
+	vgtid, filter, flags, err := vsm.resolveParams(ctx, tabletType, vgtid, filter, flags)
 	if err != nil {
 		return err
 	}
 	vs := &vstream{
-		vgtid:      vgtid,
-		tabletType: tabletType,
-		filter:     filter,
-		send:       send,
-		resolver:   vsm.resolver,
-		journaler:  make(map[int64]*journalEvent),
+		vgtid:              vgtid,
+		tabletType:         tabletType,
+		filter:             filter,
+		send:               send,
+		resolver:           vsm.resolver,
+		journaler:          make(map[int64]*journalEvent),
+		minimizeSkew:       flags.GetMinimizeSkew(),
+		skewTimeoutSeconds: 10 * 60,
+		timestamps:         make(map[string]int64),
+		vsm:                vsm,
+		eventCh:            make(chan []*binlogdatapb.VEvent),
+		heartbeatInterval:  flags.GetHeartbeatInterval(),
 	}
 	return vs.stream(ctx)
 }
 
 // resolveParams provides defaults for the inputs if they're not specified.
-func (vsm *vstreamManager) resolveParams(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter) (*binlogdatapb.VGtid, *binlogdatapb.Filter, error) {
+func (vsm *vstreamManager) resolveParams(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid,
+	filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags) (*binlogdatapb.VGtid, *binlogdatapb.Filter, *vtgatepb.VStreamFlags, error) {
+
 	if filter == nil {
 		filter = &binlogdatapb.Filter{
 			Rules: []*binlogdatapb.Rule{{
@@ -104,8 +142,12 @@ func (vsm *vstreamManager) resolveParams(ctx context.Context, tabletType topodat
 			}},
 		}
 	}
+
+	if flags == nil {
+		flags = &vtgatepb.VStreamFlags{}
+	}
 	if vgtid == nil || len(vgtid.ShardGtids) == 0 {
-		return nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vgtid must have at least one value with a starting position")
+		return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "vgtid must have at least one value with a starting position")
 	}
 	// To fetch from all keyspaces, the input must contain a single ShardGtid
 	// that has an empty keyspace, and the Gtid must be "current". In the
@@ -113,11 +155,11 @@ func (vsm *vstreamManager) resolveParams(ctx context.Context, tabletType topodat
 	// copying of existing data.
 	if len(vgtid.ShardGtids) == 1 && vgtid.ShardGtids[0].Keyspace == "" {
 		if vgtid.ShardGtids[0].Gtid != "current" {
-			return nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "for an empty keyspace, the Gtid value must be 'current': %v", vgtid)
+			return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "for an empty keyspace, the Gtid value must be 'current': %v", vgtid)
 		}
-		keyspaces, err := vsm.toposerv.GetSrvKeyspaceNames(ctx, vsm.cell)
+		keyspaces, err := vsm.toposerv.GetSrvKeyspaceNames(ctx, vsm.cell, false)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		newvgtid := &binlogdatapb.VGtid{}
 		for _, keyspace := range keyspaces {
@@ -132,12 +174,12 @@ func (vsm *vstreamManager) resolveParams(ctx context.Context, tabletType topodat
 	for _, sgtid := range vgtid.ShardGtids {
 		if sgtid.Shard == "" {
 			if sgtid.Gtid != "current" {
-				return nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "if shards are unspecified, the Gtid value must be 'current': %v", vgtid)
+				return nil, nil, nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "if shards are unspecified, the Gtid value must be 'current': %v", vgtid)
 			}
 			// TODO(sougou): this should work with the new Migrate workflow
 			_, _, allShards, err := vsm.resolver.GetKeyspaceShards(ctx, sgtid.Keyspace, tabletType)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			for _, shard := range allShards {
 				newvgtid.ShardGtids = append(newvgtid.ShardGtids, &binlogdatapb.ShardGtid{
@@ -150,12 +192,24 @@ func (vsm *vstreamManager) resolveParams(ctx context.Context, tabletType topodat
 			newvgtid.ShardGtids = append(newvgtid.ShardGtids, sgtid)
 		}
 	}
-	return newvgtid, filter, nil
+
+	//TODO add tablepk validations
+
+	return newvgtid, filter, flags, nil
 }
 
+func (vsm *vstreamManager) RecordStreamDelay() {
+	vstreamSkewDelayCount.Add(1)
+}
+
+func (vsm *vstreamManager) GetTotalStreamDelay() int64 {
+	return vstreamSkewDelayCount.Get()
+}
 func (vs *vstream) stream(ctx context.Context) error {
 	ctx, vs.cancel = context.WithCancel(ctx)
 	defer vs.cancel()
+
+	go vs.sendEvents(ctx)
 
 	// Make a copy first, because the ShardGtids list can change once streaming starts.
 	copylist := append(([]*binlogdatapb.ShardGtid)(nil), vs.vgtid.ShardGtids...)
@@ -164,6 +218,63 @@ func (vs *vstream) stream(ctx context.Context) error {
 	}
 	vs.wg.Wait()
 	return vs.err
+}
+
+func (vs *vstream) sendEvents(ctx context.Context) {
+	var heartbeat <-chan time.Time
+	var resetHeartbeat func()
+
+	if vs.heartbeatInterval == 0 {
+		heartbeat = make(chan time.Time)
+		resetHeartbeat = func() {}
+	} else {
+		d := time.Duration(vs.heartbeatInterval) * time.Second
+		timer := time.NewTicker(d)
+		defer timer.Stop()
+
+		heartbeat = timer.C
+		resetHeartbeat = func() { timer.Reset(d) }
+	}
+
+	send := func(evs []*binlogdatapb.VEvent) error {
+		if err := vs.send(evs); err != nil {
+			vs.once.Do(func() {
+				vs.err = err
+			})
+			return err
+		}
+		return nil
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			vs.once.Do(func() {
+				vs.err = fmt.Errorf("context canceled")
+			})
+			return
+		case evs := <-vs.eventCh:
+			if err := send(evs); err != nil {
+				vs.once.Do(func() {
+					vs.err = err
+				})
+				return
+			}
+			resetHeartbeat()
+		case t := <-heartbeat:
+			now := t.UnixNano()
+			evs := []*binlogdatapb.VEvent{{
+				Type:        binlogdatapb.VEventType_HEARTBEAT,
+				Timestamp:   now / 1e9,
+				CurrentTime: now,
+			}}
+			if err := send(evs); err != nil {
+				vs.once.Do(func() {
+					vs.err = err
+				})
+				return
+			}
+		}
+	}
 }
 
 // startOneStream sets up one shard stream.
@@ -181,6 +292,95 @@ func (vs *vstream) startOneStream(ctx context.Context, sgtid *binlogdatapb.Shard
 			})
 		}
 	}()
+}
+
+// MaxSkew is the threshold for a skew to be detected. Since MySQL timestamps are in seconds we account for
+// two round-offs: one for the actual event and another while accounting for the clock skew
+const MaxSkew = int64(2)
+
+// computeSkew sets the timestamp of the current event for the calling stream, accounts for a clock skew
+// and declares that a skew has arisen if the streams are too far apart
+func (vs *vstream) computeSkew(streamID string, event *binlogdatapb.VEvent) bool {
+	vs.skewMu.Lock()
+	defer vs.skewMu.Unlock()
+	// account for skew between this vtgate and the source mysql server
+	secondsInThePast := event.CurrentTime/1e9 - event.Timestamp
+	vs.timestamps[streamID] = time.Now().Unix() - secondsInThePast
+
+	var minTs, maxTs int64
+	var laggardStream string
+
+	if len(vs.timestamps) <= 1 {
+		return false
+	}
+	for k, ts := range vs.timestamps {
+		if ts < minTs || minTs == 0 {
+			minTs = ts
+			laggardStream = k
+		}
+		if ts > maxTs {
+			maxTs = ts
+		}
+	}
+	if vs.laggard != "" { // we are skewed, check if this event has fixed the skew
+		if (maxTs - minTs) <= MaxSkew {
+			vs.laggard = ""
+			close(vs.skewCh)
+		}
+	} else {
+		if (maxTs - minTs) > MaxSkew { // check if we are skewed due to this event
+			log.Infof("Skew found, laggard is %s, %+v", laggardStream, vs.timestamps)
+			vs.laggard = laggardStream
+			vs.skewCh = make(chan bool)
+		}
+	}
+	return vs.mustPause(streamID)
+}
+
+// mustPause returns true if a skew exists and the stream calling this is not the slowest one
+func (vs *vstream) mustPause(streamID string) bool {
+	switch vs.laggard {
+	case "":
+		return false
+	case streamID:
+		// current stream is the laggard, not pausing
+		return false
+	}
+
+	if (vs.timestamps[streamID] - vs.lowestTS) <= MaxSkew {
+		// current stream is not the laggard, but the skew is still within the limit
+		return false
+	}
+	vs.vsm.RecordStreamDelay()
+	return true
+}
+
+// alignStreams is called by each individual shard's stream before an event is sent to the client or after each heartbeat.
+// It checks for skew (if the minimizeSkew option is set). If skew is present this stream is delayed until the skew is fixed
+// The faster stream detects the skew and waits. The slower stream resets the skew when it catches up.
+func (vs *vstream) alignStreams(ctx context.Context, event *binlogdatapb.VEvent, keyspace, shard string) error {
+	if !vs.minimizeSkew || event.Timestamp == 0 {
+		return nil
+	}
+	streamID := fmt.Sprintf("%s/%s", keyspace, shard)
+	for {
+		mustPause := vs.computeSkew(streamID, event)
+		if event.Type == binlogdatapb.VEventType_HEARTBEAT {
+			return nil
+		}
+		if !mustPause {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(vs.skewTimeoutSeconds) * time.Second):
+			log.Errorf("timed out while waiting for skew to reduce: %s", streamID)
+			return fmt.Errorf("timed out while waiting for skew to reduce: %s", streamID)
+		case <-vs.skewCh:
+			// once skew is fixed the channel is closed and all waiting streams "wake up"
+		}
+	}
 }
 
 // streamFromTablet streams from one shard. If transactions come in separate chunks, they are grouped and sent.
@@ -203,16 +403,20 @@ func (vs *vstream) streamFromTablet(ctx context.Context, sgtid *binlogdatapb.Sha
 		}
 
 		var eventss [][]*binlogdatapb.VEvent
-		rss, err := vs.resolver.ResolveDestination(ctx, sgtid.Keyspace, vs.tabletType, key.DestinationShard(sgtid.Shard))
-		if err != nil {
-			return err
+		var err error
+		rss := vs.rss
+		if vs.resolver != nil {
+			rss, err = vs.resolver.ResolveDestination(ctx, sgtid.Keyspace, vs.tabletType, key.DestinationShard(sgtid.Shard))
+			if err != nil {
+				return err
+			}
 		}
 		if len(rss) != 1 {
 			// Unreachable.
 			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected number or shards: %v", rss)
 		}
 		// Safe to access sgtid.Gtid here (because it can't change until streaming begins).
-		err = rss[0].QueryService.VStream(ctx, rss[0].Target, sgtid.Gtid, vs.filter, func(events []*binlogdatapb.VEvent) error {
+		err = rss[0].Gateway.VStream(ctx, rss[0].Target, sgtid.Gtid, sgtid.TablePKs, vs.filter, func(events []*binlogdatapb.VEvent) error {
 			// We received a valid event. Reset error count.
 			errCount = 0
 
@@ -242,9 +446,14 @@ func (vs *vstream) streamFromTablet(ctx context.Context, sgtid *binlogdatapb.Sha
 					ev := proto.Clone(event).(*binlogdatapb.VEvent)
 					ev.RowEvent.TableName = sgtid.Keyspace + "." + ev.RowEvent.TableName
 					sendevents = append(sendevents, ev)
-				case binlogdatapb.VEventType_COMMIT, binlogdatapb.VEventType_DDL:
+				case binlogdatapb.VEventType_COMMIT, binlogdatapb.VEventType_DDL, binlogdatapb.VEventType_OTHER:
 					sendevents = append(sendevents, event)
 					eventss = append(eventss, sendevents)
+
+					if err := vs.alignStreams(ctx, event, sgtid.Keyspace, sgtid.Shard); err != nil {
+						return err
+					}
+
 					if err := vs.sendAll(sgtid, eventss); err != nil {
 						return err
 					}
@@ -254,6 +463,10 @@ func (vs *vstream) streamFromTablet(ctx context.Context, sgtid *binlogdatapb.Sha
 					// Remove all heartbeat events for now.
 					// Otherwise they can accumulate indefinitely if there are no real events.
 					// TODO(sougou): figure out a model for this.
+					if err := vs.alignStreams(ctx, event, sgtid.Keyspace, sgtid.Shard); err != nil {
+						return err
+					}
+
 				case binlogdatapb.VEventType_JOURNAL:
 					journal := event.Journal
 					// Journal events are not sent to clients.
@@ -310,6 +523,9 @@ func (vs *vstream) sendAll(sgtid *binlogdatapb.ShardGtid, eventss [][]*binlogdat
 
 	// Send all chunks while holding the lock.
 	for _, events := range eventss {
+		if vs.err != nil {
+			return vs.err
+		}
 		// convert all gtids to vgtids. This should be done here while holding the lock.
 		for j, event := range events {
 			if event.Type == binlogdatapb.VEventType_GTID {
@@ -319,11 +535,36 @@ func (vs *vstream) sendAll(sgtid *binlogdatapb.ShardGtid, eventss [][]*binlogdat
 					Type:  binlogdatapb.VEventType_VGTID,
 					Vgtid: proto.Clone(vs.vgtid).(*binlogdatapb.VGtid),
 				}
+			} else if event.Type == binlogdatapb.VEventType_LASTPK {
+				var foundIndex = -1
+				eventTablePK := event.LastPKEvent.TableLastPK
+				for idx, pk := range sgtid.TablePKs {
+					if pk.TableName == eventTablePK.TableName {
+						foundIndex = idx
+						break
+					}
+				}
+				if foundIndex == -1 {
+					if !event.LastPKEvent.Completed {
+						sgtid.TablePKs = append(sgtid.TablePKs, eventTablePK)
+					}
+				} else {
+					if event.LastPKEvent.Completed {
+						// remove tablepk from sgtid
+						sgtid.TablePKs[foundIndex] = sgtid.TablePKs[len(sgtid.TablePKs)-1]
+						sgtid.TablePKs[len(sgtid.TablePKs)-1] = nil
+						sgtid.TablePKs = sgtid.TablePKs[:len(sgtid.TablePKs)-1]
+					} else {
+						sgtid.TablePKs[foundIndex] = eventTablePK
+					}
+				}
+				events[j] = &binlogdatapb.VEvent{
+					Type:  binlogdatapb.VEventType_VGTID,
+					Vgtid: proto.Clone(vs.vgtid).(*binlogdatapb.VGtid),
+				}
 			}
 		}
-		if err := vs.send(events); err != nil {
-			return err
-		}
+		vs.eventCh <- events
 	}
 	return nil
 }

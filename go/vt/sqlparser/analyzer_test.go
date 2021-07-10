@@ -17,14 +17,14 @@ limitations under the License.
 package sqlparser
 
 import (
-	"reflect"
-	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/test/utils"
+
 	"github.com/stretchr/testify/assert"
+
 	"vitess.io/vitess/go/sqltypes"
 )
 
@@ -69,14 +69,15 @@ func TestPreview(t *testing.T) {
 		{"show", StmtShow},
 		{"use", StmtUse},
 		{"analyze", StmtOther},
-		{"describe", StmtOther},
-		{"desc", StmtOther},
-		{"explain", StmtOther},
+		{"describe", StmtExplain},
+		{"desc", StmtExplain},
+		{"explain", StmtExplain},
 		{"repair", StmtOther},
 		{"optimize", StmtOther},
 		{"grant", StmtPriv},
 		{"revoke", StmtPriv},
 		{"truncate", StmtDDL},
+		{"flush", StmtFlush},
 		{"unknown", StmtUnknown},
 
 		{"/* leading comment */ select ...", StmtSelect},
@@ -89,6 +90,7 @@ func TestPreview(t *testing.T) {
 
 		{"/* leading comment no end select ...", StmtUnknown},
 		{"-- leading single line comment no end select ...", StmtUnknown},
+		{"/*!40000 ALTER TABLE `t1` DISABLE KEYS */", StmtComment},
 	}
 	for _, tcase := range testcases {
 		if got := Preview(tcase.sql); got != tcase.want {
@@ -162,6 +164,76 @@ func TestSplitAndExpression(t *testing.T) {
 			got = append(got, String(split))
 		}
 		assert.Equal(t, tcase.out, got)
+	}
+}
+
+func TestAndExpressions(t *testing.T) {
+	greaterThanExpr := &ComparisonExpr{
+		Operator: GreaterThanOp,
+		Left: &ColName{
+			Name: NewColIdent("val"),
+			Qualifier: TableName{
+				Name: NewTableIdent("a"),
+			},
+		},
+		Right: &ColName{
+			Name: NewColIdent("val"),
+			Qualifier: TableName{
+				Name: NewTableIdent("b"),
+			},
+		},
+	}
+	equalExpr := &ComparisonExpr{
+		Operator: EqualOp,
+		Left: &ColName{
+			Name: NewColIdent("id"),
+			Qualifier: TableName{
+				Name: NewTableIdent("a"),
+			},
+		},
+		Right: &ColName{
+			Name: NewColIdent("id"),
+			Qualifier: TableName{
+				Name: NewTableIdent("b"),
+			},
+		},
+	}
+	testcases := []struct {
+		name           string
+		expressions    Exprs
+		expectedOutput Expr
+	}{
+		{
+			name:           "empty input",
+			expressions:    nil,
+			expectedOutput: nil,
+		}, {
+			name: "two equal inputs",
+			expressions: Exprs{
+				greaterThanExpr,
+				equalExpr,
+				equalExpr,
+			},
+			expectedOutput: &AndExpr{
+				Left:  greaterThanExpr,
+				Right: equalExpr,
+			},
+		},
+		{
+			name: "two equal inputs",
+			expressions: Exprs{
+				equalExpr,
+				equalExpr,
+			},
+			expectedOutput: equalExpr,
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			output := AndExpressions(testcase.expressions...)
+			assert.Equal(t, String(testcase.expectedOutput), String(output))
+		})
 	}
 }
 
@@ -243,7 +315,7 @@ func TestIsColName(t *testing.T) {
 		in:  &ColName{},
 		out: true,
 	}, {
-		in: newHexVal(""),
+		in: NewHexLiteral(""),
 	}}
 	for _, tc := range testcases {
 		out := IsColName(tc.in)
@@ -258,32 +330,35 @@ func TestIsValue(t *testing.T) {
 		in  Expr
 		out bool
 	}{{
-		in:  newStrVal("aa"),
+		in:  NewStrLiteral("aa"),
 		out: true,
 	}, {
-		in:  newHexVal("3131"),
+		in:  NewHexLiteral("3131"),
 		out: true,
 	}, {
-		in:  newIntVal("1"),
+		in:  NewIntLiteral("1"),
 		out: true,
 	}, {
-		in:  newValArg(":a"),
+		in:  NewArgument("a"),
 		out: true,
 	}, {
 		in:  &NullVal{},
 		out: false,
 	}}
 	for _, tc := range testcases {
-		out := IsValue(tc.in)
-		if out != tc.out {
-			t.Errorf("IsValue(%T): %v, want %v", tc.in, out, tc.out)
-		}
-		if tc.out {
-			// NewPlanValue should not fail for valid values.
-			if _, err := NewPlanValue(tc.in); err != nil {
-				t.Error(err)
+		t.Run(String(tc.in), func(t *testing.T) {
+			out := IsValue(tc.in)
+			if out != tc.out {
+				t.Errorf("IsValue(%T): %v, want %v", tc.in, out, tc.out)
 			}
-		}
+			if tc.out {
+				// NewPlanValue should not fail for valid values.
+				if _, err := NewPlanValue(tc.in); err != nil {
+					t.Error(err)
+				}
+			}
+
+		})
 	}
 }
 
@@ -295,7 +370,7 @@ func TestIsNull(t *testing.T) {
 		in:  &NullVal{},
 		out: true,
 	}, {
-		in: newStrVal(""),
+		in: NewStrLiteral(""),
 	}}
 	for _, tc := range testcases {
 		out := IsNull(tc.in)
@@ -310,12 +385,12 @@ func TestIsSimpleTuple(t *testing.T) {
 		in  Expr
 		out bool
 	}{{
-		in:  ValTuple{newStrVal("aa")},
+		in:  ValTuple{NewStrLiteral("aa")},
 		out: true,
 	}, {
 		in: ValTuple{&ColName{}},
 	}, {
-		in:  ListArg("::a"),
+		in:  ListArg("a"),
 		out: true,
 	}, {
 		in: &ColName{},
@@ -340,59 +415,53 @@ func TestNewPlanValue(t *testing.T) {
 		out sqltypes.PlanValue
 		err string
 	}{{
-		in: &SQLVal{
-			Type: ValArg,
-			Val:  []byte(":valarg"),
-		},
+		in:  Argument("valarg"),
 		out: sqltypes.PlanValue{Key: "valarg"},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: IntVal,
-			Val:  []byte("10"),
+			Val:  "10",
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewInt64(10)},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: IntVal,
-			Val:  []byte("1111111111111111111111111111111111111111"),
+			Val:  "1111111111111111111111111111111111111111",
 		},
 		err: "value out of range",
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: StrVal,
-			Val:  []byte("strval"),
+			Val:  "strval",
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: BitVal,
-			Val:  []byte("01100001"),
+			Val:  "01100001",
 		},
 		err: "expression is too complex",
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: HexVal,
-			Val:  []byte("3131"),
+			Val:  "3131",
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("11")},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: HexVal,
-			Val:  []byte("313"),
+			Val:  "313",
 		},
 		err: "odd length hex string",
 	}, {
-		in:  ListArg("::list"),
+		in:  ListArg("list"),
 		out: sqltypes.PlanValue{ListKey: "list"},
 	}, {
 		in: ValTuple{
-			&SQLVal{
-				Type: ValArg,
-				Val:  []byte(":valarg"),
-			},
-			&SQLVal{
+			Argument("valarg"),
+			&Literal{
 				Type: StrVal,
-				Val:  []byte("strval"),
+				Val:  "strval",
 			},
 		},
 		out: sqltypes.PlanValue{
@@ -404,231 +473,77 @@ func TestNewPlanValue(t *testing.T) {
 		},
 	}, {
 		in: ValTuple{
-			ListArg("::list"),
+			ListArg("list"),
 		},
 		err: "unsupported: nested lists",
 	}, {
 		in:  &NullVal{},
 		out: sqltypes.PlanValue{},
 	}, {
-		in: &SQLVal{
+		in: &Literal{
 			Type: FloatVal,
-			Val:  []byte("2.1"),
+			Val:  "2.1",
 		},
 		out: sqltypes.PlanValue{Value: sqltypes.NewFloat64(2.1)},
+	}, {
+		in: &UnaryExpr{
+			Operator: Latin1Op,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  "strval",
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: UBinaryOp,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  "strval",
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: Utf8mb4Op,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  "strval",
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: Utf8Op,
+			Expr: &Literal{
+				Type: StrVal,
+				Val:  "strval",
+			},
+		},
+		out: sqltypes.PlanValue{Value: sqltypes.NewVarBinary("strval")},
+	}, {
+		in: &UnaryExpr{
+			Operator: UMinusOp,
+			Expr: &Literal{
+				Type: FloatVal,
+				Val:  "2.1",
+			},
+		},
+		err: "expression is too complex",
 	}}
 	for _, tc := range tcases {
-		got, err := NewPlanValue(tc.in)
-		if tc.err != "" {
-			if !strings.Contains(err.Error(), tc.err) {
-				t.Errorf("NewPlanValue(%s) error: %v, want '%s'", String(tc.in), err, tc.err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Error(err)
-			continue
-		}
-		if !reflect.DeepEqual(tc.out, got) {
-			t.Errorf("NewPlanValue(%s): %v, want %v", String(tc.in), got, tc.out)
-		}
-	}
-}
-
-func TestExtractSetValues(t *testing.T) {
-	testcases := []struct {
-		sql   string
-		out   map[SetKey]interface{}
-		scope string
-		err   string
-	}{{
-		sql: "invalid",
-		err: "syntax error at position 8 near 'invalid'",
-	}, {
-		sql: "select * from t",
-		err: "ast did not yield *sqlparser.Set: *sqlparser.Select",
-	}, {
-		sql: "set autocommit=1+1",
-		err: "invalid syntax: 1 + 1",
-	}, {
-		sql: "set transaction_mode='single'",
-		out: map[SetKey]interface{}{{Key: "transaction_mode", Scope: ImplicitStr}: "single"},
-	}, {
-		sql: "set autocommit=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: ImplicitStr}: int64(1)},
-	}, {
-		sql: "set autocommit=true",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: ImplicitStr}: int64(1)},
-	}, {
-		sql: "set autocommit=false",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: ImplicitStr}: int64(0)},
-	}, {
-		sql: "set autocommit=on",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: ImplicitStr}: "on"},
-	}, {
-		sql: "set autocommit=off",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: ImplicitStr}: "off"},
-	}, {
-		sql: "set @@global.autocommit=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: GlobalStr}: int64(1)},
-	}, {
-		sql: "set @@global.autocommit=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: GlobalStr}: int64(1)},
-	}, {
-		sql: "set @@session.autocommit=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: SessionStr}: int64(1)},
-	}, {
-		sql: "set @@session.`autocommit`=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: SessionStr}: int64(1)},
-	}, {
-		sql: "set @@session.'autocommit'=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: SessionStr}: int64(1)},
-	}, {
-		sql: "set @@session.\"autocommit\"=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: SessionStr}: int64(1)},
-	}, {
-		sql: "set @@session.'\"autocommit'=1",
-		out: map[SetKey]interface{}{{Key: "\"autocommit", Scope: SessionStr}: int64(1)},
-	}, {
-		sql: "set @@session.`autocommit'`=1",
-		out: map[SetKey]interface{}{{Key: "autocommit'", Scope: SessionStr}: int64(1)},
-	}, {
-		sql: "set AUTOCOMMIT=1",
-		out: map[SetKey]interface{}{{Key: "autocommit", Scope: ImplicitStr}: int64(1)},
-	}, {
-		sql: "SET character_set_results = NULL",
-		out: map[SetKey]interface{}{{Key: "character_set_results", Scope: ImplicitStr}: nil},
-	}, {
-		sql: "SET foo = 0x1234",
-		err: "invalid value type: 0x1234",
-	}, {
-		sql: "SET names utf8",
-		out: map[SetKey]interface{}{{Key: "names", Scope: ImplicitStr}: "utf8"},
-	}, {
-		sql: "SET names ascii collate ascii_bin",
-		out: map[SetKey]interface{}{{Key: "names", Scope: ImplicitStr}: "ascii"},
-	}, {
-		sql: "SET charset default",
-		out: map[SetKey]interface{}{{Key: "charset", Scope: ImplicitStr}: "default"},
-	}, {
-		sql: "SET character set ascii",
-		out: map[SetKey]interface{}{{Key: "charset", Scope: ImplicitStr}: "ascii"},
-	}, {
-		sql:   "SET SESSION wait_timeout = 3600",
-		out:   map[SetKey]interface{}{{Key: "wait_timeout", Scope: ImplicitStr}: int64(3600)},
-		scope: SessionStr,
-	}, {
-		sql:   "SET GLOBAL wait_timeout = 3600",
-		out:   map[SetKey]interface{}{{Key: "wait_timeout", Scope: ImplicitStr}: int64(3600)},
-		scope: GlobalStr,
-	}, {
-		sql:   "set session transaction isolation level repeatable read",
-		out:   map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: IsolationLevelRepeatableRead},
-		scope: SessionStr,
-	}, {
-		sql:   "set session transaction isolation level read committed",
-		out:   map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: IsolationLevelReadCommitted},
-		scope: SessionStr,
-	}, {
-		sql:   "set session transaction isolation level read uncommitted",
-		out:   map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: IsolationLevelReadUncommitted},
-		scope: SessionStr,
-	}, {
-		sql:   "set session transaction isolation level serializable",
-		out:   map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: IsolationLevelSerializable},
-		scope: SessionStr,
-	}, {
-		sql: "set transaction isolation level serializable",
-		out: map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: IsolationLevelSerializable},
-	}, {
-		sql: "set transaction read only",
-		out: map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: TxReadOnly},
-	}, {
-		sql: "set transaction read write",
-		out: map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: TxReadWrite},
-	}, {
-		sql:   "set session transaction read write",
-		out:   map[SetKey]interface{}{{Key: TransactionStr, Scope: ImplicitStr}: TxReadWrite},
-		scope: SessionStr,
-	}, {
-		sql:   "set session tx_read_only = 0",
-		out:   map[SetKey]interface{}{{Key: "tx_read_only", Scope: ImplicitStr}: int64(0)},
-		scope: SessionStr,
-	}, {
-		sql:   "set session tx_read_only = 1",
-		out:   map[SetKey]interface{}{{Key: "tx_read_only", Scope: ImplicitStr}: int64(1)},
-		scope: SessionStr,
-	}, {
-		sql:   "set session sql_safe_updates = 0",
-		out:   map[SetKey]interface{}{{Key: "sql_safe_updates", Scope: ImplicitStr}: int64(0)},
-		scope: SessionStr,
-	}, {
-		sql:   "set session transaction_read_only = 0",
-		out:   map[SetKey]interface{}{{Key: "transaction_read_only", Scope: ImplicitStr}: int64(0)},
-		scope: SessionStr,
-	}, {
-		sql:   "set session transaction_read_only = 1",
-		out:   map[SetKey]interface{}{{Key: "transaction_read_only", Scope: ImplicitStr}: int64(1)},
-		scope: SessionStr,
-	}, {
-		sql:   "set session sql_safe_updates = 1",
-		out:   map[SetKey]interface{}{{Key: "sql_safe_updates", Scope: ImplicitStr}: int64(1)},
-		scope: SessionStr,
-	}, {
-		sql: "set @foo = 42",
-		out: map[SetKey]interface{}{
-			{Key: "foo", Scope: VariableStr}: int64(42),
-		},
-		scope: ImplicitStr,
-	}, {
-		sql: "set @foo.bar.baz = 42",
-		out: map[SetKey]interface{}{
-			{Key: "foo.bar.baz", Scope: VariableStr}: int64(42),
-		},
-		scope: ImplicitStr,
-	}, {
-		sql: "set @`string` = 'abc', @`float` = 4.2, @`int` = 42",
-		out: map[SetKey]interface{}{
-			{Key: "string", Scope: VariableStr}: "abc",
-			{Key: "float", Scope: VariableStr}:  4.2,
-			{Key: "int", Scope: VariableStr}:    int64(42),
-		},
-		scope: ImplicitStr,
-	}, {
-		sql: "set session @foo = 42",
-		err: "unsupported in set: scope and user defined variables",
-	}, {
-		sql: "set global @foo = 42",
-		err: "unsupported in set: scope and user defined variables",
-	}}
-	for _, tcase := range testcases {
-		t.Run(tcase.sql, func(t *testing.T) {
-			out, _, err := ExtractSetValues(tcase.sql)
-			if tcase.err != "" {
-				require.Error(t, err, tcase.err)
-			} else if err != nil {
-				require.NoError(t, err)
+		t.Run(String(tc.in), func(t *testing.T) {
+			got, err := NewPlanValue(tc.in)
+			if tc.err != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.err)
+				return
 			}
 
-			if diff := cmp.Diff(tcase.out, out); diff != "" {
-				t.Error(diff)
-			}
+			require.NoError(t, err)
+			mustMatch(t, tc.out, got, "wut!")
 		})
 	}
 }
 
-func newStrVal(in string) *SQLVal {
-	return NewStrVal([]byte(in))
-}
-
-func newIntVal(in string) *SQLVal {
-	return NewIntVal([]byte(in))
-}
-
-func newHexVal(in string) *SQLVal {
-	return NewHexVal([]byte(in))
-}
-
-func newValArg(in string) *SQLVal {
-	return NewValArg([]byte(in))
-}
+var mustMatch = utils.MustMatchFn(".Conn")

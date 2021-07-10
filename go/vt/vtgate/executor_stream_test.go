@@ -20,8 +20,11 @@ import (
 	"testing"
 	"time"
 
+	"context"
+
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
+
+	"vitess.io/vitess/go/cache"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/discovery"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -31,7 +34,7 @@ import (
 )
 
 func TestStreamSQLUnsharded(t *testing.T) {
-	executor, _, _, _ := createExecutorEnv()
+	executor, _, _, _ := createLegacyExecutorEnv()
 	logChan := QueryLogger.Subscribe("Test")
 	defer QueryLogger.Unsubscribe(logChan)
 
@@ -45,19 +48,19 @@ func TestStreamSQLUnsharded(t *testing.T) {
 }
 
 func TestStreamSQLSharded(t *testing.T) {
-	// Special setup: Don't use createExecutorEnv.
+	// Special setup: Don't use createLegacyExecutorEnv.
 	cell := "aa"
-	hc := discovery.NewFakeHealthCheck()
+	hc := discovery.NewFakeLegacyHealthCheck()
 	s := createSandbox("TestExecutor")
 	s.VSchema = executorVSchema
 	getSandbox(KsTestUnsharded).VSchema = unshardedVSchema
 	serv := new(sandboxTopo)
-	resolver := newTestResolver(hc, serv, cell)
+	resolver := newTestLegacyResolver(hc, serv, cell)
 	shards := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
 	for _, shard := range shards {
 		_ = hc.AddTestTablet(cell, shard, 1, "TestExecutor", shard, topodatapb.TabletType_MASTER, true, 1, nil)
 	}
-	executor := NewExecutor(context.Background(), serv, cell, resolver, false, testBufferSize, testCacheSize)
+	executor := NewExecutor(context.Background(), serv, cell, resolver, false, false, testBufferSize, cache.DefaultConfig, nil)
 
 	sql := "stream * from sharded_user_msgs"
 	result, err := executorStreamMessages(executor, sql)
@@ -80,6 +83,26 @@ func TestStreamSQLSharded(t *testing.T) {
 	}
 }
 
+func TestStreamError(t *testing.T) {
+	executor, _, _, _ := createLegacyExecutorEnv()
+	logChan := QueryLogger.Subscribe("TestStreamError")
+	defer QueryLogger.Unsubscribe(logChan)
+
+	queries := []string{
+		"start transaction",
+		"begin",
+		"rollback",
+		"commit",
+	}
+	for _, query := range queries {
+		t.Run(query, func(t *testing.T) {
+			_, err := executorStreamMessages(executor, query)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "OLAP does not supported statement")
+		})
+	}
+}
+
 func executorStreamMessages(executor *Executor, sql string) (qr *sqltypes.Result, err error) {
 	results := make(chan *sqltypes.Result, 100)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -90,7 +113,7 @@ func executorStreamMessages(executor *Executor, sql string) (qr *sqltypes.Result
 		NewSafeSession(masterSession),
 		sql,
 		nil,
-		querypb.Target{
+		&querypb.Target{
 			TabletType: topodatapb.TabletType_MASTER,
 		},
 		func(qr *sqltypes.Result) error {

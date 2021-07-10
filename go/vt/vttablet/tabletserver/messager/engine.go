@@ -19,7 +19,7 @@ package messager
 import (
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/sync2"
@@ -44,7 +44,7 @@ type TabletService interface {
 // VStreamer defines  the functions of VStreamer
 // that the messager needs.
 type VStreamer interface {
-	Stream(ctx context.Context, startPos string, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error
+	Stream(ctx context.Context, startPos string, tablePKs []*binlogdatapb.TableLastPK, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error
 	StreamResults(ctx context.Context, query string, send func(*binlogdatapb.VStreamResultsResponse) error) error
 }
 
@@ -66,20 +66,24 @@ func NewEngine(tsv TabletService, se *schema.Engine, vs VStreamer) *Engine {
 		tsv:          tsv,
 		se:           se,
 		vs:           vs,
-		postponeSema: sync2.NewSemaphore(tsv.Config().MessagePostponeCap, 0),
+		postponeSema: sync2.NewSemaphore(tsv.Config().MessagePostponeParallelism, 0),
 		managers:     make(map[string]*messageManager),
 	}
 }
 
 // Open starts the Engine service.
-func (me *Engine) Open() error {
+func (me *Engine) Open() {
+	me.mu.Lock()
 	if me.isOpen {
-		return nil
+		me.mu.Unlock()
+		return
 	}
-
+	me.mu.Unlock()
+	log.Info("Messager: opening")
+	// Unlock before invoking RegisterNotifier because it
+	// obtains the same lock.
 	me.se.RegisterNotifier("messages", me.schemaChanged)
 	me.isOpen = true
-	return nil
 }
 
 // Close closes the Engine service.
@@ -95,6 +99,7 @@ func (me *Engine) Close() {
 		mm.Close()
 	}
 	me.managers = make(map[string]*messageManager)
+	log.Info("Messager: closed")
 }
 
 // Subscribe subscribes to messages from the requested table.

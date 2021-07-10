@@ -24,9 +24,12 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+
+	"context"
+
 	"github.com/olekukonko/tablewriter"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -130,7 +133,7 @@ func parseExecuteOptions(value string) (*querypb.ExecuteOptions, error) {
 		return nil, nil
 	}
 	result := &querypb.ExecuteOptions{}
-	if err := proto.UnmarshalText(value, result); err != nil {
+	if err := prototext.Unmarshal([]byte(value), result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal options: %v", err)
 	}
 	return result, nil
@@ -228,11 +231,12 @@ func commandVtTabletExecute(ctx context.Context, wr *wrangler.Wrangler, subFlags
 		return fmt.Errorf("BuildBindVariables failed: %v", err)
 	}
 
+	// We do not support reserve connection through vtctl commands, so reservedID is always 0.
 	qr, err := conn.Execute(ctx, &querypb.Target{
 		Keyspace:   tabletInfo.Tablet.Keyspace,
 		Shard:      tabletInfo.Tablet.Shard,
 		TabletType: tabletInfo.Tablet.Type,
-	}, subFlags.Arg(1), bindVars, int64(*transactionID), executeOptions)
+	}, subFlags.Arg(1), bindVars, int64(*transactionID), 0, executeOptions)
 	if err != nil {
 		return fmt.Errorf("execute failed: %v", err)
 	}
@@ -276,7 +280,7 @@ func commandVtTabletBegin(ctx context.Context, wr *wrangler.Wrangler, subFlags *
 	}
 	defer conn.Close(ctx)
 
-	transactionID, err := conn.Begin(ctx, &querypb.Target{
+	transactionID, _, err := conn.Begin(ctx, &querypb.Target{
 		Keyspace:   tabletInfo.Tablet.Keyspace,
 		Shard:      tabletInfo.Tablet.Shard,
 		TabletType: tabletInfo.Tablet.Type,
@@ -327,11 +331,13 @@ func commandVtTabletCommit(ctx context.Context, wr *wrangler.Wrangler, subFlags 
 	}
 	defer conn.Close(ctx)
 
-	return conn.Commit(ctx, &querypb.Target{
+	// we do not support reserving through vtctl commands
+	_, err = conn.Commit(ctx, &querypb.Target{
 		Keyspace:   tabletInfo.Tablet.Keyspace,
 		Shard:      tabletInfo.Tablet.Shard,
 		TabletType: tabletInfo.Tablet.Type,
 	}, transactionID)
+	return err
 }
 
 func commandVtTabletRollback(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
@@ -371,11 +377,13 @@ func commandVtTabletRollback(ctx context.Context, wr *wrangler.Wrangler, subFlag
 	}
 	defer conn.Close(ctx)
 
-	return conn.Rollback(ctx, &querypb.Target{
+	// we do not support reserving through vtctl commands
+	_, err = conn.Rollback(ctx, &querypb.Target{
 		Keyspace:   tabletInfo.Tablet.Keyspace,
 		Shard:      tabletInfo.Tablet.Shard,
 		TabletType: tabletInfo.Tablet.Type,
 	}, transactionID)
+	return err
 }
 
 func commandVtTabletStreamHealth(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
@@ -440,6 +448,13 @@ func (lw loggerWriter) Write(p []byte) (int, error) {
 
 // printQueryResult will pretty-print a QueryResult to the logger.
 func printQueryResult(writer io.Writer, qr *sqltypes.Result) {
+	if qr == nil {
+		return
+	}
+	if len(qr.Rows) == 0 {
+		return
+	}
+
 	table := tablewriter.NewWriter(writer)
 	table.SetAutoFormatHeaders(false)
 

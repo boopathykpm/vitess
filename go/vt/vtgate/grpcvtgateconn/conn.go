@@ -22,7 +22,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -162,6 +163,40 @@ func (conn *vtgateConn) StreamExecute(ctx context.Context, session *vtgatepb.Ses
 	}, nil
 }
 
+func (conn *vtgateConn) Prepare(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (*vtgatepb.Session, []*querypb.Field, error) {
+	request := &vtgatepb.PrepareRequest{
+		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
+		Session:  session,
+		Query: &querypb.BoundQuery{
+			Sql:           query,
+			BindVariables: bindVars,
+		},
+	}
+	response, err := conn.c.Prepare(ctx, request)
+	if err != nil {
+		return session, nil, vterrors.FromGRPC(err)
+	}
+	if response.Error != nil {
+		return response.Session, nil, vterrors.FromVTRPC(response.Error)
+	}
+	return response.Session, response.Fields, nil
+}
+
+func (conn *vtgateConn) CloseSession(ctx context.Context, session *vtgatepb.Session) error {
+	request := &vtgatepb.CloseSessionRequest{
+		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
+		Session:  session,
+	}
+	response, err := conn.c.CloseSession(ctx, request)
+	if err != nil {
+		return vterrors.FromGRPC(err)
+	}
+	if response.Error != nil {
+		return vterrors.FromVTRPC(response.Error)
+	}
+	return nil
+}
+
 func (conn *vtgateConn) ResolveTransaction(ctx context.Context, dtid string) error {
 	request := &vtgatepb.ResolveTransactionRequest{
 		CallerId: callerid.EffectiveCallerIDFromContext(ctx),
@@ -183,12 +218,15 @@ func (a *vstreamAdapter) Recv() ([]*binlogdatapb.VEvent, error) {
 	return r.Events, nil
 }
 
-func (conn *vtgateConn) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter) (vtgateconn.VStreamReader, error) {
+func (conn *vtgateConn) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid,
+	filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags) (vtgateconn.VStreamReader, error) {
+
 	req := &vtgatepb.VStreamRequest{
 		CallerId:   callerid.EffectiveCallerIDFromContext(ctx),
 		TabletType: tabletType,
 		Vgtid:      vgtid,
 		Filter:     filter,
+		Flags:      flags,
 	}
 	stream, err := conn.c.VStream(ctx, req)
 	if err != nil {
@@ -202,3 +240,6 @@ func (conn *vtgateConn) VStream(ctx context.Context, tabletType topodatapb.Table
 func (conn *vtgateConn) Close() {
 	conn.cc.Close()
 }
+
+// Make sure vtgateConn implements vtgateconn.Impl
+var _ vtgateconn.Impl = (*vtgateConn)(nil)

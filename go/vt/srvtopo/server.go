@@ -21,7 +21,7 @@ use the topology service in a serving environment.
 package srvtopo
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -37,7 +37,7 @@ type Server interface {
 
 	// GetSrvKeyspaceNames returns the list of keyspaces served in
 	// the provided cell.
-	GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error)
+	GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error)
 
 	// GetSrvKeyspace returns the SrvKeyspace for a cell/keyspace.
 	GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error)

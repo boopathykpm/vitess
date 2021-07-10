@@ -21,15 +21,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"context"
+
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/logutil"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 )
 
-func checkOpCounts(t *testing.T, tw *TopologyWatcher, prevCounts, deltas map[string]int64) map[string]int64 {
+func checkOpCounts(t *testing.T, prevCounts, deltas map[string]int64) map[string]int64 {
 	t.Helper()
 	newCounts := topologyWatcherOperations.Counts()
 	for key, prevVal := range prevCounts {
@@ -58,37 +60,22 @@ func checkChecksum(t *testing.T, tw *TopologyWatcher, want uint32) {
 }
 
 func TestCellTabletsWatcher(t *testing.T) {
-	checkWatcher(t, true, true)
+	checkWatcher(t, true)
 }
 
 func TestCellTabletsWatcherNoRefreshKnown(t *testing.T) {
-	checkWatcher(t, true, false)
+	checkWatcher(t, false)
 }
 
-func TestShardReplicationWatcher(t *testing.T) {
-	checkWatcher(t, false, true)
-}
-
-func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
+func checkWatcher(t *testing.T, refreshKnownTablets bool) {
 	ts := memorytopo.NewServer("aa")
 	fhc := NewFakeHealthCheck()
 	logger := logutil.NewMemoryLogger()
 	topologyWatcherOperations.ZeroAll()
 	counts := topologyWatcherOperations.Counts()
-	var tw *TopologyWatcher
-	if cellTablets {
-		tw = NewCellTabletsWatcher(context.Background(), ts, fhc, "aa", 10*time.Minute, refreshKnownTablets, 5)
-	} else {
-		tw = NewShardReplicationWatcher(context.Background(), ts, fhc, "aa", "keyspace", "shard", 10*time.Minute, 5)
-	}
+	tw := NewCellTabletsWatcher(context.Background(), ts, fhc, nil, "aa", 10*time.Minute, refreshKnownTablets, 5)
 
-	// Wait for the initial topology load to finish. Otherwise we
-	// have a background loadTablets() that's running, and it can
-	// interact with our tests in weird ways.
-	if err := tw.WaitForInitialTopology(); err != nil {
-		t.Fatalf("initial WaitForInitialTopology failed")
-	}
-	counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1})
+	counts = checkOpCounts(t, counts, map[string]int64{})
 	checkChecksum(t, tw, 0)
 
 	// Add a tablet to the topology.
@@ -108,8 +95,8 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 		t.Fatalf("CreateTablet failed: %v", err)
 	}
 	tw.loadTablets()
-	counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "AddTablet": 1})
-	checkChecksum(t, tw, 1261153186)
+	counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "AddTablet": 1})
+	checkChecksum(t, tw, 3238442862)
 
 	// Check the tablet is returned by GetAllTablets().
 	allTablets := fhc.GetAllTablets()
@@ -136,14 +123,14 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	}
 	tw.loadTablets()
 
-	// If refreshKnownTablets is disabled, only the new tablet is read
+	// If RefreshKnownTablets is disabled, only the new tablet is read
 	// from the topo
 	if refreshKnownTablets {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "AddTablet": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "AddTablet": 1})
 	} else {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "AddTablet": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "AddTablet": 1})
 	}
-	checkChecksum(t, tw, 832404892)
+	checkChecksum(t, tw, 2762153755)
 
 	// Check the new tablet is returned by GetAllTablets().
 	allTablets = fhc.GetAllTablets()
@@ -152,20 +139,20 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 		t.Errorf("fhc.GetAllTablets() = %+v; want %+v", allTablets, tablet2)
 	}
 
-	// Load the tablets again to show that when refreshKnownTablets is disabled,
+	// Load the tablets again to show that when RefreshKnownTablets is disabled,
 	// only the list is read from the topo and the checksum doesn't change
 	tw.loadTablets()
 	if refreshKnownTablets {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2})
 	} else {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1})
 	}
-	checkChecksum(t, tw, 832404892)
+	checkChecksum(t, tw, 2762153755)
 
 	// same tablet, different port, should update (previous
 	// one should go away, new one be added)
 	//
-	// if refreshKnownTablets is disabled, this case is *not*
+	// if RefreshKnownTablets is disabled, this case is *not*
 	// detected and the tablet remains in the topo using the
 	// old key
 	origTablet := proto.Clone(tablet).(*topodatapb.Tablet)
@@ -182,7 +169,7 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	key = TabletToMapKey(tablet)
 
 	if refreshKnownTablets {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 1})
 
 		if _, ok := allTablets[key]; !ok || len(allTablets) != 2 || !proto.Equal(allTablets[key], tablet) {
 			t.Errorf("fhc.GetAllTablets() = %+v; want %+v", allTablets, tablet)
@@ -190,9 +177,9 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 		if _, ok := allTablets[origKey]; ok {
 			t.Errorf("fhc.GetAllTablets() = %+v; don't want %v", allTablets, origKey)
 		}
-		checkChecksum(t, tw, 698548794)
+		checkChecksum(t, tw, 2762153755)
 	} else {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1})
 
 		if _, ok := allTablets[origKey]; !ok || len(allTablets) != 2 || !proto.Equal(allTablets[origKey], origTablet) {
 			t.Errorf("fhc.GetAllTablets() = %+v; want %+v", allTablets, origTablet)
@@ -200,47 +187,15 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 		if _, ok := allTablets[key]; ok {
 			t.Errorf("fhc.GetAllTablets() = %+v; don't want %v", allTablets, key)
 		}
-		checkChecksum(t, tw, 832404892)
-	}
-
-	// Remove the second tablet and re-add with a new uid. This should
-	// trigger a ReplaceTablet in loadTablets because the uid does not
-	// match.
-	//
-	// This case *is* detected even if refreshKnownTablets is false
-	// because the delete tablet / create tablet sequence causes the
-	// list of tablets to change and therefore the change is detected.
-	if err := ts.DeleteTablet(context.Background(), tablet2.Alias); err != nil {
-		t.Fatalf("DeleteTablet failed: %v", err)
-	}
-	tablet2.Alias.Uid = 3
-	if err := ts.CreateTablet(context.Background(), tablet2); err != nil {
-		t.Fatalf("CreateTablet failed: %v", err)
-	}
-	if err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
-		t.Fatalf("FixShardReplication failed: %v", err)
-	}
-	tw.loadTablets()
-	allTablets = fhc.GetAllTablets()
-
-	if refreshKnownTablets {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 1})
-		checkChecksum(t, tw, 4097170367)
-	} else {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "ReplaceTablet": 1})
-		checkChecksum(t, tw, 3960185881)
-	}
-	key = TabletToMapKey(tablet2)
-	if _, ok := allTablets[key]; !ok || len(allTablets) != 2 || !proto.Equal(allTablets[key], tablet2) {
-		t.Errorf("fhc.GetAllTablets() = %+v; want %v => %+v", allTablets, key, tablet2)
+		checkChecksum(t, tw, 2762153755)
 	}
 
 	// Both tablets restart on different hosts.
 	// tablet2 happens to land on the host:port that tablet 1 used to be on.
 	// This can only be tested when we refresh known tablets.
 	if refreshKnownTablets {
-		origTablet := *tablet
-		origTablet2 := *tablet2
+		origTablet := proto.Clone(tablet).(*topodatapb.Tablet)
+		origTablet2 := proto.Clone(tablet2).(*topodatapb.Tablet)
 
 		if _, err := ts.UpdateTabletFields(context.Background(), tablet2.Alias, func(t *topodatapb.Tablet) error {
 			t.Hostname = tablet.Hostname
@@ -258,7 +213,7 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 			t.Fatalf("UpdateTabletFields failed: %v", err)
 		}
 		tw.loadTablets()
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 2})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 2})
 		allTablets = fhc.GetAllTablets()
 		key2 := TabletToMapKey(tablet2)
 		if _, ok := allTablets[key2]; !ok {
@@ -282,7 +237,7 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 			t.Fatalf("UpdateTabletFields failed: %v", err)
 		}
 		tw.loadTablets()
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 2})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "ReplaceTablet": 2})
 	}
 
 	// Remove the tablet and check that it is detected as being gone.
@@ -294,11 +249,11 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	}
 	tw.loadTablets()
 	if refreshKnownTablets {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "RemoveTablet": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 1, "RemoveTablet": 1})
 	} else {
-		counts = checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "RemoveTablet": 1})
+		counts = checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "RemoveTablet": 1})
 	}
-	checkChecksum(t, tw, 1725545897)
+	checkChecksum(t, tw, 789108290)
 
 	allTablets = fhc.GetAllTablets()
 	key = TabletToMapKey(tablet)
@@ -318,7 +273,7 @@ func checkWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 		t.Fatalf("FixShardReplication failed: %v", err)
 	}
 	tw.loadTablets()
-	checkOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 0, "RemoveTablet": 1})
+	checkOpCounts(t, counts, map[string]int64{"ListTablets": 1, "GetTablet": 0, "RemoveTablet": 1})
 	checkChecksum(t, tw, 0)
 
 	allTablets = fhc.GetAllTablets()
@@ -395,7 +350,7 @@ func TestFilterByShard(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		fbs, err := NewFilterByShard(nil, tc.filters)
+		fbs, err := NewFilterByShard(tc.filters)
 		if err != nil {
 			t.Errorf("cannot create FilterByShard for filters %v: %v", tc.filters, err)
 		}
@@ -405,7 +360,7 @@ func TestFilterByShard(t *testing.T) {
 			Shard:    tc.shard,
 		}
 
-		got := fbs.isIncluded(tablet)
+		got := fbs.IsIncluded(tablet)
 		if got != tc.included {
 			t.Errorf("isIncluded(%v,%v) for filters %v returned %v but expected %v", tc.keyspace, tc.shard, tc.filters, got, tc.included)
 		}
@@ -433,9 +388,9 @@ var (
 
 func TestFilterByKeyspace(t *testing.T) {
 	hc := NewFakeHealthCheck()
-	tr := NewFilterByKeyspace(hc, testKeyspacesToWatch)
+	f := NewFilterByKeyspace(testKeyspacesToWatch)
 	ts := memorytopo.NewServer(testCell)
-	tw := NewCellTabletsWatcher(context.Background(), ts, tr, testCell, 10*time.Minute, true, 5)
+	tw := NewCellTabletsWatcher(context.Background(), ts, hc, f, testCell, 10*time.Minute, true, 5)
 
 	for _, test := range testFilterByKeyspace {
 		// Add a new tablet to the topology.
@@ -453,7 +408,7 @@ func TestFilterByKeyspace(t *testing.T) {
 			Shard:    testShard,
 		}
 
-		got := tr.isIncluded(tablet)
+		got := f.IsIncluded(tablet)
 		if got != test.expected {
 			t.Errorf("isIncluded(%v) for keyspace %v returned %v but expected %v", test.keyspace, test.keyspace, got, test.expected)
 		}
@@ -483,7 +438,7 @@ func TestFilterByKeyspace(t *testing.T) {
 			Keyspace: test.keyspace,
 			Shard:    testShard,
 		}
-		got = tr.isIncluded(tabletReplacement)
+		got = f.IsIncluded(tabletReplacement)
 		if got != test.expected {
 			t.Errorf("isIncluded(%v) for keyspace %v returned %v but expected %v", test.keyspace, test.keyspace, got, test.expected)
 		}

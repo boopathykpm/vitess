@@ -29,7 +29,7 @@ import (
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/log"
 
-	"golang.org/x/net/context"
+	"context"
 )
 
 // CreateReparentJournal returns the commands to execute to create
@@ -92,13 +92,8 @@ func (mysqld *Mysqld) WaitForReparentJournal(ctx context.Context, timeCreatedNS 
 	}
 }
 
-// Deprecated: use mysqld.MasterPosition() instead
-func (mysqld *Mysqld) DemoteMaster() (rp mysql.Position, err error) {
-	return mysqld.MasterPosition()
-}
-
-// PromoteSlave will promote a slave to be the new master.
-func (mysqld *Mysqld) PromoteSlave(hookExtraEnv map[string]string) (mysql.Position, error) {
+// Promote will promote this server to be the new master.
+func (mysqld *Mysqld) Promote(hookExtraEnv map[string]string) (mysql.Position, error) {
 	ctx := context.TODO()
 	conn, err := getPoolReconnect(ctx, mysqld.dbaPool)
 	if err != nil {
@@ -108,7 +103,7 @@ func (mysqld *Mysqld) PromoteSlave(hookExtraEnv map[string]string) (mysql.Positi
 
 	// Since we handle replication, just stop it.
 	cmds := []string{
-		conn.StopSlaveCommand(),
+		conn.StopReplicationCommand(),
 		"RESET SLAVE ALL", // "ALL" makes it forget master host:port.
 		// When using semi-sync and GTID, a replica first connects to the new master with a given GTID set,
 		// it can take a long time to scan the current binlog file to find the corresponding position.
@@ -121,5 +116,5 @@ func (mysqld *Mysqld) PromoteSlave(hookExtraEnv map[string]string) (mysql.Positi
 	if err := mysqld.executeSuperQueryListConn(ctx, conn, cmds); err != nil {
 		return mysql.Position{}, err
 	}
-	return conn.MasterPosition()
+	return conn.PrimaryPosition()
 }

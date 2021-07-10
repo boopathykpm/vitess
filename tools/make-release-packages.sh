@@ -35,22 +35,27 @@ mkdir -p releases
 
 # Copy a subset of binaries from issue #5421
 mkdir -p "${RELEASE_DIR}/bin"
-for binary in vttestserver mysqlctl mysqlctld query_analyzer topo2topo vtaclcheck vtbackup vtbench vtclient vtcombo vtctl vtctlclient vtctld vtexplain vtgate vttablet vtworker vtworkerclient zk zkctl zkctld; do 
+for binary in vttestserver mysqlctl mysqlctld query_analyzer topo2topo vtaclcheck vtbackup vtbench vtclient vtcombo vtctl vtctldclient vtctlclient vtctld vtexplain vtgate vttablet vtorc vtworker vtworkerclient zk zkctl zkctld; do 
  cp "bin/$binary" "${RELEASE_DIR}/bin/"
 done;
 
 # Copy remaining files, preserving date/permissions
 # But resolving symlinks
-mkdir -p "${RELEASE_DIR}"/share/vitess/
-cp -rpfL examples "${RELEASE_DIR}"/share/vitess/
+cp -rpfL examples "${RELEASE_DIR}"
 
-echo "Follow the binary installation instructions at: https://vitess.io/docs/get-started/local/" > "${RELEASE_DIR}"/share/vitess/examples/README.md
+echo "Follow the installation instructions at: https://vitess.io/docs/get-started/local/" > "${RELEASE_DIR}"/examples/README.md
 
 cd "${RELEASE_DIR}/.."
 tar -czf "${TAR_FILE}" "${RELEASE_ID}"
 
 cd "${RELEASE_DIR}"
 PREFIX=${PREFIX:-/usr}
+
+# For RPMs and DEBs, binaries will be in /usr/bin
+# Examples will be in /usr/share/vitess/examples
+
+mkdir -p share/vitess/
+mv examples share/vitess/
 
 fpm \
    --force \

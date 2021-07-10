@@ -43,7 +43,8 @@ import (
 
 	rice "github.com/GeertJohan/go.rice"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/dbconnpool"
@@ -75,7 +76,7 @@ var (
 	socketFile        = flag.String("mysqlctl_socket", "", "socket file to use for remote mysqlctl actions (empty for local actions)")
 
 	// masterConnectRetry is used in 'SET MASTER' commands
-	masterConnectRetry = flag.Duration("master_connect_retry", 10*time.Second, "how long to wait in between slave -> connection attempts. Only precise to the second.")
+	masterConnectRetry = flag.Duration("master_connect_retry", 10*time.Second, "how long to wait in between replica reconnect attempts. Only precise to the second.")
 
 	versionRegex = regexp.MustCompile(`Ver ([0-9]+)\.([0-9]+)\.([0-9]+)`)
 )
@@ -121,12 +122,12 @@ func NewMysqld(dbcfgs *dbconfigs.DBConfigs) *Mysqld {
 	 but also relies on none of the flavor detection features being
 	 used at runtime. Currently this assumption is guaranteed true.
 	*/
-	if dbconfigs.HasConnectionParams() {
+	if dbconfigs.GlobalDBConfigs.HasGlobalSettings() {
 		log.Info("mysqld is unmanaged or remote. Skipping flavor detection")
 		return result
 	}
-	version, getErr := getVersionString()
-	f, v, err := parseVersionString(version)
+	version, getErr := GetVersionString()
+	f, v, err := ParseVersionString(version)
 
 	/*
 	 By default Vitess searches in vtenv.VtMysqlRoot() for a mysqld binary.
@@ -147,7 +148,7 @@ func NewMysqld(dbcfgs *dbconfigs.DBConfigs) *Mysqld {
 	*/
 
 	if getErr != nil || err != nil {
-		f, v, err = getVersionFromEnv()
+		f, v, err = GetVersionFromEnv()
 		if err != nil {
 			vtenvMysqlRoot, _ := vtenv.VtMysqlRoot()
 			message := fmt.Sprintf(`could not auto-detect MySQL version. You may need to set your PATH so a mysqld binary can be found, or set the environment variable MYSQL_FLAVOR if mysqld is not available locally:
@@ -172,31 +173,32 @@ func NewMysqld(dbcfgs *dbconfigs.DBConfigs) *Mysqld {
 }
 
 /*
-getVersionFromEnv returns the flavor and an assumed version based on the legacy
+GetVersionFromEnv returns the flavor and an assumed version based on the legacy
 MYSQL_FLAVOR environment variable.
 
 The assumed version may not be accurate since the legacy variable only specifies
 broad families of compatible versions. However, the differences between those
 versions should only matter if Vitess is managing the lifecycle of mysqld, in which
 case we should have a local copy of the mysqld binary from which we can fetch
-the accurate version instead of falling back to this function (see getVersionString).
+the accurate version instead of falling back to this function (see GetVersionString).
 */
-func getVersionFromEnv() (flavor mysqlFlavor, ver serverVersion, err error) {
+func GetVersionFromEnv() (flavor mysqlFlavor, ver serverVersion, err error) {
 	env := os.Getenv("MYSQL_FLAVOR")
 	switch env {
 	case "MariaDB":
-		return flavorMariaDB, serverVersion{10, 0, 10}, nil
+		return FlavorMariaDB, serverVersion{10, 0, 10}, nil
 	case "MariaDB103":
-		return flavorMariaDB, serverVersion{10, 3, 7}, nil
+		return FlavorMariaDB, serverVersion{10, 3, 7}, nil
 	case "MySQL80":
-		return flavorMySQL, serverVersion{8, 0, 11}, nil
+		return FlavorMySQL, serverVersion{8, 0, 11}, nil
 	case "MySQL56":
-		return flavorMySQL, serverVersion{5, 7, 10}, nil
+		return FlavorMySQL, serverVersion{5, 7, 10}, nil
 	}
 	return flavor, ver, fmt.Errorf("could not determine version from MYSQL_FLAVOR: %s", env)
 }
 
-func getVersionString() (string, error) {
+// GetVersionString runs mysqld --version and returns its output as a string
+func GetVersionString() (string, error) {
 	mysqlRoot, err := vtenv.VtMysqlRoot()
 	if err != nil {
 		return "", err
@@ -212,16 +214,16 @@ func getVersionString() (string, error) {
 	return version, nil
 }
 
-// parse the output of mysqld --version into a flavor and version
-func parseVersionString(version string) (flavor mysqlFlavor, ver serverVersion, err error) {
+// ParseVersionString parses the output of mysqld --version into a flavor and version
+func ParseVersionString(version string) (flavor mysqlFlavor, ver serverVersion, err error) {
 	if strings.Contains(version, "Percona") {
-		flavor = flavorPercona
+		flavor = FlavorPercona
 	} else if strings.Contains(version, "MariaDB") {
-		flavor = flavorMariaDB
+		flavor = FlavorMariaDB
 	} else {
 		// OS distributed MySQL releases have a version string like:
 		// mysqld  Ver 5.7.27-0ubuntu0.19.04.1 for Linux on x86_64 ((Ubuntu))
-		flavor = flavorMySQL
+		flavor = FlavorMySQL
 	}
 	v := versionRegex.FindStringSubmatch(version)
 	if len(v) != 4 {
@@ -269,7 +271,7 @@ func (mysqld *Mysqld) RunMysqlUpgrade() error {
 	// privileges' right in the middle, and then subsequent
 	// commands fail if we don't use valid credentials. So let's
 	// use dba credentials.
-	params, err := mysqld.dbcfgs.Dba().MysqlParams()
+	params, err := mysqld.dbcfgs.DbaConnector().MysqlParams()
 	if err != nil {
 		return err
 	}
@@ -343,7 +345,7 @@ func (mysqld *Mysqld) startNoWait(ctx context.Context, cnf *Mycnf, mysqldArgs ..
 	switch hr := hook.NewHook("mysqld_start", mysqldArgs).Execute(); hr.ExitStatus {
 	case hook.HOOK_SUCCESS:
 		// hook exists and worked, we can keep going
-		name = "mysqld_start hook"
+		name = "mysqld_start hook" //nolint
 	case hook.HOOK_DOES_NOT_EXIST:
 		// hook doesn't exist, run mysqld_safe ourselves
 		log.Infof("%v: No mysqld_start hook, running mysqld_safe directly", ts)
@@ -436,7 +438,7 @@ func (mysqld *Mysqld) startNoWait(ctx context.Context, cnf *Mycnf, mysqldArgs ..
 // will use the dba credentials to try to connect. Use wait() with
 // different credentials if needed.
 func (mysqld *Mysqld) Wait(ctx context.Context, cnf *Mycnf) error {
-	params, err := mysqld.dbcfgs.Dba().MysqlParams()
+	params, err := mysqld.dbcfgs.DbaConnector().MysqlParams()
 	if err != nil {
 		return err
 	}
@@ -511,7 +513,7 @@ func (mysqld *Mysqld) Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bo
 
 	// try the mysqld shutdown hook, if any
 	h := hook.NewSimpleHook("mysqld_shutdown")
-	hr := h.Execute()
+	hr := h.ExecuteContext(ctx)
 	switch hr.ExitStatus {
 	case hook.HOOK_SUCCESS:
 		// hook exists and worked, we can keep going
@@ -526,7 +528,7 @@ func (mysqld *Mysqld) Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bo
 		if err != nil {
 			return err
 		}
-		params, err := mysqld.dbcfgs.Dba().MysqlParams()
+		params, err := mysqld.dbcfgs.DbaConnector().MysqlParams()
 		if err != nil {
 			return err
 		}
@@ -813,9 +815,9 @@ func (mysqld *Mysqld) getMycnfTemplate() string {
 
 	// mysql version specific file.
 	// master_{flavor}{major}{minor}.cnf
-	f := flavorMariaDB
+	f := FlavorMariaDB
 	if mysqld.capabilities.isMySQLLike() {
-		f = flavorMySQL
+		f = FlavorMySQL
 	}
 	fn := fmt.Sprintf("mycnf/master_%s%d%d.cnf", f, mysqld.capabilities.version.Major, mysqld.capabilities.version.Minor)
 	b, err = riceBox.Bytes(fn)
@@ -1096,13 +1098,13 @@ func (mysqld *Mysqld) GetAppConnection(ctx context.Context) (*dbconnpool.PooledD
 }
 
 // GetDbaConnection creates a new DBConnection.
-func (mysqld *Mysqld) GetDbaConnection() (*dbconnpool.DBConnection, error) {
-	return dbconnpool.NewDBConnection(mysqld.dbcfgs.Dba())
+func (mysqld *Mysqld) GetDbaConnection(ctx context.Context) (*dbconnpool.DBConnection, error) {
+	return dbconnpool.NewDBConnection(ctx, mysqld.dbcfgs.DbaConnector())
 }
 
 // GetAllPrivsConnection creates a new DBConnection.
-func (mysqld *Mysqld) GetAllPrivsConnection() (*dbconnpool.DBConnection, error) {
-	return dbconnpool.NewDBConnection(mysqld.dbcfgs.AllPrivsWithDB())
+func (mysqld *Mysqld) GetAllPrivsConnection(ctx context.Context) (*dbconnpool.DBConnection, error) {
+	return dbconnpool.NewDBConnection(ctx, mysqld.dbcfgs.AllPrivsWithDB())
 }
 
 // Close will close this instance of Mysqld. It will wait for all dba

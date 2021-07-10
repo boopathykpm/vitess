@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -72,7 +73,7 @@ func TestLookupUniqueMap(t *testing.T) {
 	require.NoError(t, err)
 	want := []key.Destination{
 		key.DestinationKeyspaceID([]byte("1")),
-		key.DestinationKeyspaceID([]byte("1")),
+		key.DestinationNone{},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Map(): %+v, want %+v", got, want)
@@ -167,10 +168,10 @@ func TestLookupUniqueCreate(t *testing.T) {
 	require.NoError(t, err)
 
 	wantqueries := []*querypb.BoundQuery{{
-		Sql: "insert into t(from, toc) values(:from0, :toc0)",
+		Sql: "insert into t(from, toc) values(:from_0, :toc_0)",
 		BindVariables: map[string]*querypb.BindVariable{
-			"from0": sqltypes.Int64BindVariable(1),
-			"toc0":  sqltypes.BytesBindVariable([]byte("test")),
+			"from_0": sqltypes.Int64BindVariable(1),
+			"toc_0":  sqltypes.BytesBindVariable([]byte("test")),
 		},
 	}}
 	if !reflect.DeepEqual(vc.queries, wantqueries) {

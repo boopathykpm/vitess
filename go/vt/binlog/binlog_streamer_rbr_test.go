@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/dbconfigs"
@@ -236,7 +236,7 @@ func TestStreamerParseRBREvents(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -481,7 +481,7 @@ func TestStreamerParseRBRNameEscapes(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,

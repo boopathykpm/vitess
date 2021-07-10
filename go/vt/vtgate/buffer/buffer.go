@@ -32,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/discovery"
@@ -88,7 +88,7 @@ type Buffer struct {
 	// In particular, it is used to serialize the following Go routines:
 	// - 1. Requests which may buffer (RLock, can be run in parallel)
 	// - 2. Request which starts buffering (based on the seen error)
-	// - 3. HealthCheck listener ("StatsUpdate") which stops buffering
+	// - 3. LegacyHealthCheck listener ("StatsUpdate") which stops buffering
 	// - 4. Timer which may stop buffering after -buffer_max_failover_duration
 	mu sync.RWMutex
 	// buffers holds a shardBuffer object per shard, even if no failover is in
@@ -195,7 +195,7 @@ type RetryDoneFunc context.CancelFunc
 func (b *Buffer) WaitForFailoverEnd(ctx context.Context, keyspace, shard string, err error) (RetryDoneFunc, error) {
 	// If an err is given, it must be related to a failover.
 	// We never buffer requests with other errors.
-	if err != nil && !causedByFailover(err) {
+	if err != nil && !CausedByFailover(err) {
 		return nil, nil
 	}
 
@@ -213,12 +213,33 @@ func (b *Buffer) WaitForFailoverEnd(ctx context.Context, keyspace, shard string,
 	return sb.waitForFailoverEnd(ctx, keyspace, shard, err)
 }
 
+// ProcessMasterHealth notifies the buffer to record a new master
+// and end any failover buffering that may be in progress
+func (b *Buffer) ProcessMasterHealth(th *discovery.TabletHealth) {
+	if th.Target.TabletType != topodatapb.TabletType_MASTER {
+		panic(fmt.Sprintf("BUG: non MASTER TabletHealth object must not be forwarded: %#v", th))
+	}
+	timestamp := th.MasterTermStartTime
+	if timestamp == 0 {
+		// Masters where TabletExternallyReparented was never called will return 0.
+		// Ignore them.
+		return
+	}
+
+	sb := b.getOrCreateBuffer(th.Target.Keyspace, th.Target.Shard)
+	if sb == nil {
+		// Buffer is shut down. Ignore all calls.
+		return
+	}
+	sb.recordExternallyReparentedTimestamp(timestamp, th.Tablet.Alias)
+}
+
 // StatsUpdate keeps track of the "tablet_externally_reparented_timestamp" of
 // each master. This way we can detect the end of a failover.
-// It is part of the discovery.HealthCheckStatsListener interface.
-func (b *Buffer) StatsUpdate(ts *discovery.TabletStats) {
+// It is part of the discovery.LegacyHealthCheckStatsListener interface.
+func (b *Buffer) StatsUpdate(ts *discovery.LegacyTabletStats) {
 	if ts.Target.TabletType != topodatapb.TabletType_MASTER {
-		panic(fmt.Sprintf("BUG: non MASTER TabletStats object must not be forwarded: %#v", ts))
+		panic(fmt.Sprintf("BUG: non MASTER LegacyTabletStats object must not be forwarded: %#v", ts))
 	}
 
 	timestamp := ts.TabletExternallyReparentedTimestamp
@@ -236,32 +257,33 @@ func (b *Buffer) StatsUpdate(ts *discovery.TabletStats) {
 	sb.recordExternallyReparentedTimestamp(timestamp, ts.Tablet.Alias)
 }
 
-// causedByFailover returns true if "err" was supposedly caused by a failover.
+// CausedByFailover returns true if "err" was supposedly caused by a failover.
 // To simplify things, we've merged the detection for different MySQL flavors
 // in one function. Supported flavors: MariaDB, MySQL, Google internal.
-func causedByFailover(err error) bool {
+func CausedByFailover(err error) bool {
 	log.V(2).Infof("Checking error (type: %T) if it is caused by a failover. err: %v", err, err)
 
 	// TODO(sougou): Remove the INTERNAL check after rollout.
 	if code := vterrors.Code(err); code != vtrpcpb.Code_FAILED_PRECONDITION && code != vtrpcpb.Code_INTERNAL {
 		return false
 	}
+	errString := err.Error()
 	switch {
 	// All flavors.
-	case strings.Contains(err.Error(), "operation not allowed in state NOT_SERVING") ||
-		strings.Contains(err.Error(), "operation not allowed in state SHUTTING_DOWN") ||
+	case strings.Contains(errString, "operation not allowed in state NOT_SERVING") ||
+		strings.Contains(errString, "operation not allowed in state SHUTTING_DOWN") ||
 		// Match 1290 if -queryserver-config-terse-errors explicitly hid the error message
 		// (which it does to avoid logging the original query including any PII).
-		strings.Contains(err.Error(), "(errno 1290) (sqlstate HY000) during query:"):
+		strings.Contains(errString, "(errno 1290) (sqlstate HY000) during query:"):
 		return true
 	// MariaDB flavor.
-	case strings.Contains(err.Error(), "The MariaDB server is running with the --read-only option so it cannot execute this statement (errno 1290) (sqlstate HY000)"):
+	case strings.Contains(errString, "The MariaDB server is running with the --read-only option so it cannot execute this statement (errno 1290) (sqlstate HY000)"):
 		return true
 	// MySQL flavor.
-	case strings.Contains(err.Error(), "The MySQL server is running with the --read-only option so it cannot execute this statement (errno 1290) (sqlstate HY000)"):
+	case strings.Contains(errString, "The MySQL server is running with the --read-only option so it cannot execute this statement (errno 1290) (sqlstate HY000)"):
 		return true
 	// Google internal flavor.
-	case strings.Contains(err.Error(), "failover in progress (errno 1227) (sqlstate 42000)"):
+	case strings.Contains(errString, "failover in progress (errno 1227) (sqlstate 42000)"):
 		return true
 	}
 	return false

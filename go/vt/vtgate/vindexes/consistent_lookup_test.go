@@ -27,6 +27,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -69,8 +70,7 @@ func TestConsistentLookupUniqueInfo(t *testing.T) {
 func TestConsistentLookupMap(t *testing.T) {
 	lookup := createConsistentLookup(t, "consistent_lookup", false)
 	vc := &loggingVCursor{}
-	vc.AddResult(makeTestResult(2), nil)
-	vc.AddResult(makeTestResult(2), nil)
+	vc.AddResult(makeTestResultLookup([]int{2, 2}), nil)
 
 	got, err := lookup.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
@@ -88,8 +88,7 @@ func TestConsistentLookupMap(t *testing.T) {
 		t.Errorf("Map(): %#v, want %+v", got, want)
 	}
 	vc.verifyLog(t, []string{
-		"Execute select toc from t where fromc1 = :fromc1 [{fromc1 1}] false",
-		"Execute select toc from t where fromc1 = :fromc1 [{fromc1 2}] false",
+		"ExecutePre select fromc1, toc from t where fromc1 in ::fromc1 [{fromc1 }] false",
 	})
 
 	// Test query fail.
@@ -122,8 +121,7 @@ func TestConsistentLookupMapWriteOnly(t *testing.T) {
 func TestConsistentLookupUniqueMap(t *testing.T) {
 	lookup := createConsistentLookup(t, "consistent_lookup_unique", false)
 	vc := &loggingVCursor{}
-	vc.AddResult(makeTestResult(0), nil)
-	vc.AddResult(makeTestResult(1), nil)
+	vc.AddResult(makeTestResultLookup([]int{0, 1}), nil)
 
 	got, err := lookup.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
@@ -135,12 +133,11 @@ func TestConsistentLookupUniqueMap(t *testing.T) {
 		t.Errorf("Map(): %#v, want %+v", got, want)
 	}
 	vc.verifyLog(t, []string{
-		"Execute select toc from t where fromc1 = :fromc1 [{fromc1 1}] false",
-		"Execute select toc from t where fromc1 = :fromc1 [{fromc1 2}] false",
+		"ExecutePre select fromc1, toc from t where fromc1 in ::fromc1 [{fromc1 }] false",
 	})
 
 	// More than one result is invalid
-	vc.AddResult(makeTestResult(2), nil)
+	vc.AddResult(makeTestResultLookup([]int{2}), nil)
 	_, err = lookup.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1)})
 	wanterr := "Lookup.Map: unexpected multiple results from vindex t: INT64(1)"
 	if err == nil || err.Error() != wanterr {
@@ -169,8 +166,7 @@ func TestConsistentLookupUniqueMapWriteOnly(t *testing.T) {
 func TestConsistentLookupMapAbsent(t *testing.T) {
 	lookup := createConsistentLookup(t, "consistent_lookup", false)
 	vc := &loggingVCursor{}
-	vc.AddResult(makeTestResult(0), nil)
-	vc.AddResult(makeTestResult(0), nil)
+	vc.AddResult(makeTestResultLookup([]int{0, 0}), nil)
 
 	got, err := lookup.Map(vc, []sqltypes.Value{sqltypes.NewInt64(1), sqltypes.NewInt64(2)})
 	require.NoError(t, err)
@@ -182,8 +178,7 @@ func TestConsistentLookupMapAbsent(t *testing.T) {
 		t.Errorf("Map(): %#v, want %+v", got, want)
 	}
 	vc.verifyLog(t, []string{
-		"Execute select toc from t where fromc1 = :fromc1 [{fromc1 1}] false",
-		"Execute select toc from t where fromc1 = :fromc1 [{fromc1 2}] false",
+		"ExecutePre select fromc1, toc from t where fromc1 in ::fromc1 [{fromc1 }] false",
 	})
 }
 
@@ -236,7 +231,7 @@ func TestConsistentLookupCreateSimple(t *testing.T) {
 		t.Error(err)
 	}
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0), (:fromc11, :fromc21, :toc1) [{fromc10 1} {fromc11 3} {fromc20 2} {fromc21 4} {toc0 test1} {toc1 test2}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0), (:fromc1_1, :fromc2_1, :toc_1) [{fromc1_0 1} {fromc1_1 3} {fromc2_0 2} {fromc2_1 4} {toc_0 test1} {toc_1 test2}] true",
 	})
 }
 
@@ -257,7 +252,7 @@ func TestConsistentLookupCreateThenRecreate(t *testing.T) {
 		t.Error(err)
 	}
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 1} {fromc20 2} {toc0 test1}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 1} {fromc2_0 2} {toc_0 test1}] true",
 		"ExecutePre select toc from t where fromc1 = :fromc1 and fromc2 = :fromc2 for update [{fromc1 1} {fromc2 2} {toc test1}] false",
 		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1, :fromc2, :toc) [{fromc1 1} {fromc2 2} {toc test1}] true",
 	})
@@ -281,9 +276,9 @@ func TestConsistentLookupCreateThenUpdate(t *testing.T) {
 		t.Error(err)
 	}
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 1} {fromc20 2} {toc0 test1}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 1} {fromc2_0 2} {toc_0 test1}] true",
 		"ExecutePre select toc from t where fromc1 = :fromc1 and fromc2 = :fromc2 for update [{fromc1 1} {fromc2 2} {toc test1}] false",
-		"ExecuteKeyspaceID select fc1 from t1 where fc1 = :fromc1 and fc2 = :fromc2 lock in share mode [{fromc1 1} {fromc2 2} {toc test1}] false",
+		"ExecuteKeyspaceID select fc1 from `dot.t1` where fc1 = :fromc1 and fc2 = :fromc2 lock in share mode [{fromc1 1} {fromc2 2} {toc test1}] false",
 		"ExecutePre update t set toc=:toc where fromc1 = :fromc1 and fromc2 = :fromc2 [{fromc1 1} {fromc2 2} {toc test1}] true",
 	})
 }
@@ -306,16 +301,16 @@ func TestConsistentLookupCreateThenSkipUpdate(t *testing.T) {
 		t.Error(err)
 	}
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 1} {fromc20 2} {toc0 1}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 1} {fromc2_0 2} {toc_0 1}] true",
 		"ExecutePre select toc from t where fromc1 = :fromc1 and fromc2 = :fromc2 for update [{fromc1 1} {fromc2 2} {toc 1}] false",
-		"ExecuteKeyspaceID select fc1 from t1 where fc1 = :fromc1 and fc2 = :fromc2 lock in share mode [{fromc1 1} {fromc2 2} {toc 1}] false",
+		"ExecuteKeyspaceID select fc1 from `dot.t1` where fc1 = :fromc1 and fc2 = :fromc2 lock in share mode [{fromc1 1} {fromc2 2} {toc 1}] false",
 	})
 }
 
 func TestConsistentLookupCreateThenDupkey(t *testing.T) {
 	lookup := createConsistentLookup(t, "consistent_lookup", false)
 	vc := &loggingVCursor{}
-	vc.AddResult(nil, errors.New("Duplicate entry"))
+	vc.AddResult(nil, errors.New("Duplicate entry, pass mysql error as it is"))
 	vc.AddResult(makeTestResult(1), nil)
 	vc.AddResult(makeTestResult(1), nil)
 	vc.AddResult(&sqltypes.Result{}, nil)
@@ -327,14 +322,12 @@ func TestConsistentLookupCreateThenDupkey(t *testing.T) {
 		}},
 		[][]byte{[]byte("test1")},
 		false /* ignoreMode */)
-	want := "duplicate entry"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("lookup(query fail) err: %v, must contain %s", err, want)
-	}
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Duplicate entry, pass mysql error as it is")
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 1} {fromc20 2} {toc0 test1}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 1} {fromc2_0 2} {toc_0 test1}] true",
 		"ExecutePre select toc from t where fromc1 = :fromc1 and fromc2 = :fromc2 for update [{fromc1 1} {fromc2 2} {toc test1}] false",
-		"ExecuteKeyspaceID select fc1 from t1 where fc1 = :fromc1 and fc2 = :fromc2 lock in share mode [{fromc1 1} {fromc2 2} {toc test1}] false",
+		"ExecuteKeyspaceID select fc1 from `dot.t1` where fc1 = :fromc1 and fc2 = :fromc2 lock in share mode [{fromc1 1} {fromc2 2} {toc test1}] false",
 	})
 }
 
@@ -355,7 +348,7 @@ func TestConsistentLookupCreateNonDupError(t *testing.T) {
 		t.Errorf("lookup(query fail) err: %v, must contain %s", err, want)
 	}
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 1} {fromc20 2} {toc0 test1}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 1} {fromc2_0 2} {toc_0 test1}] true",
 	})
 }
 
@@ -377,7 +370,7 @@ func TestConsistentLookupCreateThenBadRows(t *testing.T) {
 		t.Errorf("lookup(query fail) err: %v, must contain %s", err, want)
 	}
 	vc.verifyLog(t, []string{
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 1} {fromc20 2} {toc0 test1}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 1} {fromc2_0 2} {toc_0 test1}] true",
 		"ExecutePre select toc from t where fromc1 = :fromc1 and fromc2 = :fromc2 for update [{fromc1 1} {fromc2 2} {toc test1}] false",
 	})
 }
@@ -420,7 +413,7 @@ func TestConsistentLookupUpdate(t *testing.T) {
 	}
 	vc.verifyLog(t, []string{
 		"ExecutePost delete from t where fromc1 = :fromc1 and fromc2 = :fromc2 and toc = :toc [{fromc1 1} {fromc2 2} {toc test}] true",
-		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc10, :fromc20, :toc0) [{fromc10 3} {fromc20 4} {toc0 test}] true",
+		"ExecutePre insert into t(fromc1, fromc2, toc) values(:fromc1_0, :fromc2_0, :toc_0) [{fromc1_0 3} {fromc2_0 4} {toc_0 test}] true",
 	})
 }
 
@@ -459,20 +452,17 @@ func TestConsistentLookupUpdateBecauseUncomparableTypes(t *testing.T) {
 		{querypb.Type_VARCHAR, "some string"},
 		{querypb.Type_CHAR, "some string"},
 		{querypb.Type_BIT, "some string"},
-		{querypb.Type_ENUM, "some string"},
-		{querypb.Type_SET, "some string"},
 		{querypb.Type_GEOMETRY, "some string"},
-		{querypb.Type_JSON, "some string"},
 	}
 
 	for _, val := range tests {
 		t.Run(val.typ.String(), func(t *testing.T) {
 			vc.AddResult(&sqltypes.Result{}, nil)
 			vc.AddResult(&sqltypes.Result{}, nil)
-			sqlVal, err := sqltypes.NewValue(val.typ, []byte(val.val))
+			literal, err := sqltypes.NewValue(val.typ, []byte(val.val))
 			require.NoError(t, err)
 
-			err = lookup.(Lookup).Update(vc, []sqltypes.Value{sqlVal, sqlVal}, []byte("test"), []sqltypes.Value{sqlVal, sqlVal})
+			err = lookup.(Lookup).Update(vc, []sqltypes.Value{literal, literal}, []byte("test"), []sqltypes.Value{literal, literal})
 			require.NoError(t, err)
 			require.NotEmpty(t, vc.log)
 			vc.log = nil
@@ -499,17 +489,27 @@ func createConsistentLookup(t *testing.T, name string, writeOnly bool) SingleCol
 		sqlparser.NewColIdent("fc1"),
 		sqlparser.NewColIdent("fc2"),
 	}
-	if err := l.(WantOwnerInfo).SetOwnerInfo("ks", "t1", cols); err != nil {
+	if err := l.(WantOwnerInfo).SetOwnerInfo("ks", "dot.t1", cols); err != nil {
 		t.Fatal(err)
 	}
 	return l.(SingleColumn)
 }
+
+var _ VCursor = (*loggingVCursor)(nil)
 
 type loggingVCursor struct {
 	results []*sqltypes.Result
 	errors  []error
 	index   int
 	log     []string
+}
+
+func (vc *loggingVCursor) LookupRowLockShardSession() vtgatepb.CommitOrder {
+	return vtgatepb.CommitOrder_PRE
+}
+
+func (vc *loggingVCursor) InTransactionAndIsDML() bool {
+	return false
 }
 
 type bv struct {
@@ -574,15 +574,38 @@ func (vc *loggingVCursor) verifyLog(t *testing.T, want []string) {
 	}
 }
 
+// create lookup result with one to one mapping
 func makeTestResult(numRows int) *sqltypes.Result {
 	result := &sqltypes.Result{
-		Fields:       sqltypes.MakeTestFields("keyspace_id", "varbinary"),
+		Fields:       sqltypes.MakeTestFields("id|keyspace_id", "bigint|varbinary"),
 		RowsAffected: uint64(numRows),
 	}
 	for i := 0; i < numRows; i++ {
 		result.Rows = append(result.Rows, []sqltypes.Value{
+			sqltypes.NewInt64(int64(i + 1)),
 			sqltypes.NewVarBinary(strconv.Itoa(i + 1)),
 		})
+	}
+	return result
+}
+
+// create lookup result with many to many mapping
+func makeTestResultLookup(numRows []int) *sqltypes.Result {
+	total := 0
+	for _, t := range numRows {
+		total += t
+	}
+	result := &sqltypes.Result{
+		Fields:       sqltypes.MakeTestFields("id|keyspace_id", "bigint|varbinary"),
+		RowsAffected: uint64(total),
+	}
+	for i, row := range numRows {
+		for j := 0; j < row; j++ {
+			result.Rows = append(result.Rows, []sqltypes.Value{
+				sqltypes.NewInt64(int64(i + 1)),
+				sqltypes.NewVarBinary(strconv.Itoa(j + 1)),
+			})
+		}
 	}
 	return result
 }

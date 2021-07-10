@@ -29,6 +29,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -168,7 +169,7 @@ func TestMasterRestartSetsTERTimestamp(t *testing.T) {
 	err := clusterInstance.VtctlclientProcess.InitShardMaster(keyspaceName, shardName, cell, replicaTablet.TabletUID)
 	require.Nil(t, err)
 
-	err = replicaTablet.VttabletProcess.WaitForTabletType("SERVING")
+	err = replicaTablet.VttabletProcess.WaitForTabletStatus("SERVING")
 	require.Nil(t, err)
 
 	// Capture the current TER.
@@ -223,7 +224,7 @@ func TestMasterRestartSetsTERTimestamp(t *testing.T) {
 	// Reset master
 	err = clusterInstance.VtctlclientProcess.InitShardMaster(keyspaceName, shardName, cell, masterTablet.TabletUID)
 	require.Nil(t, err)
-	err = masterTablet.VttabletProcess.WaitForTabletType("SERVING")
+	err = masterTablet.VttabletProcess.WaitForTabletStatus("SERVING")
 	require.Nil(t, err)
 
 }

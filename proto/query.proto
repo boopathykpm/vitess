@@ -22,7 +22,7 @@ option go_package = "vitess.io/vitess/go/vt/proto/query";
 
 package query;
 
-option java_package="io.vitess.proto";
+option java_package = "io.vitess.proto";
 
 import "topodata.proto";
 import "vtrpc.proto";
@@ -70,6 +70,8 @@ message EventToken {
 
 // Flags sent from the MySQL C API
 enum MySqlFlag {
+  option allow_alias = true;
+  
   EMPTY = 0;
   NOT_NULL_FLAG = 1;
   PRI_KEY_FLAG = 2;
@@ -90,8 +92,6 @@ enum MySqlFlag {
   GROUP_FLAG = 32768;
   UNIQUE_FLAG = 65536;
   BINCMP_FLAG = 131072;
-
-  option allow_alias = true;
 }
 
 // Flag allows us to qualify types by their common properties.
@@ -297,6 +297,24 @@ message ExecuteOptions {
   // skip_query_plan_cache specifies if the query plan should be cached by vitess.
   // By default all query plans are cached.
   bool skip_query_plan_cache = 10;
+
+  enum PlannerVersion {
+    DEFAULT_PLANNER = 0;
+    V3 = 1;
+    Gen4 = 2;
+    Gen4Greedy = 3;
+    Gen4Left2Right = 4;
+    Gen4WithFallback = 5;
+  }
+  
+  // PlannerVersion specifies which planner to use. 
+  // If DEFAULT is chosen, whatever vtgate was started with will be used
+  PlannerVersion planner_version = 11;
+
+  // has_created_temp_tables signals whether plans created in this session should be cached or not
+  // if the user has created temp tables, Vitess will not reuse plans created for this session in other sessions.
+  // The current session can still use other sessions cached plans.
+  bool has_created_temp_tables = 12;
 }
 
 // Field describes a single column returned by a query
@@ -326,6 +344,9 @@ message Field {
 
   // flags is actually a uint16. Only the lower 16 bits are used.
   uint32 flags = 10;
+
+  // column_type is optionally populated from information_schema.columns
+  string column_type = 11;
 }
 
 // Row is a database row.
@@ -404,6 +425,7 @@ message ExecuteRequest {
   BoundQuery query = 4;
   int64 transaction_id = 5;
   ExecuteOptions options = 6;
+  int64 reserved_id = 7;
 }
 
 // ExecuteResponse is the returned value from Execute
@@ -464,6 +486,7 @@ message BeginRequest {
 // BeginResponse is the returned value from Begin
 message BeginResponse {
   int64 transaction_id = 1;
+  topodata.TabletAlias tablet_alias = 2;
 }
 
 // CommitRequest is the payload to Commit
@@ -475,7 +498,9 @@ message CommitRequest {
 }
 
 // CommitResponse is the returned value from Commit
-message CommitResponse {}
+message CommitResponse {
+  int64 reserved_id = 1;
+}
 
 // RollbackRequest is the payload to Rollback
 message RollbackRequest {
@@ -486,7 +511,9 @@ message RollbackRequest {
 }
 
 // RollbackResponse is the returned value from Rollback
-message RollbackResponse {}
+message RollbackResponse {
+  int64 reserved_id = 1;
+}
 
 // PrepareRequest is the payload to Prepare
 message PrepareRequest {
@@ -590,6 +617,8 @@ message BeginExecuteRequest {
   Target target = 3;
   BoundQuery query = 4;
   ExecuteOptions options = 5;
+  int64 reserved_id = 6;
+  repeated string pre_queries = 7;
 }
 
 // BeginExecuteResponse is the returned value from BeginExecute
@@ -603,6 +632,7 @@ message BeginExecuteResponse {
 
   // transaction_id might be non-zero even if an error is present.
   int64 transaction_id = 3;
+  topodata.TabletAlias tablet_alias = 4;
 }
 
 // BeginExecuteBatchRequest is the payload to BeginExecuteBatch
@@ -626,6 +656,7 @@ message BeginExecuteBatchResponse {
 
   // transaction_id might be non-zero even if an error is present.
   int64 transaction_id = 3;
+  topodata.TabletAlias tablet_alias = 4;
 }
 
 // MessageStreamRequest is the request payload for MessageStream.
@@ -660,6 +691,63 @@ message MessageAckResponse {
   QueryResult result = 1;
 }
 
+// ReserveExecuteRequest is the payload to ReserveExecute
+message ReserveExecuteRequest {
+  vtrpc.CallerID effective_caller_id = 1;
+  VTGateCallerID immediate_caller_id = 2;
+  Target target = 3;
+  BoundQuery query = 4;
+  int64 transaction_id = 5;
+  ExecuteOptions options = 6;
+  repeated string pre_queries = 7;
+}
+
+// ReserveExecuteResponse is the returned value from ReserveExecute
+message ReserveExecuteResponse {
+  vtrpc.RPCError error = 1;
+  QueryResult result = 2;
+
+  // The following fields might be non-zero even if an error is present.
+  int64 reserved_id = 3;
+  topodata.TabletAlias tablet_alias = 4;
+}
+
+// ReserveBeginExecuteRequest is the payload to ReserveBeginExecute
+message ReserveBeginExecuteRequest {
+  vtrpc.CallerID effective_caller_id = 1;
+  VTGateCallerID immediate_caller_id = 2;
+  Target target = 3;
+  BoundQuery query = 4;
+  ExecuteOptions options = 5;
+  repeated string pre_queries = 6;
+}
+
+// ReserveBeginExecuteResponse is the returned value from ReserveBeginExecute
+message ReserveBeginExecuteResponse {
+  // error contains an application level error if necessary. Note the
+  // transaction_id may be set, even when an error is returned, if the begin
+  // worked but the execute failed.
+  vtrpc.RPCError error = 1;
+  QueryResult result = 2;
+  // The following fields might be non-zero even if an error is present.
+  int64 transaction_id = 3;
+  int64 reserved_id = 4;
+  topodata.TabletAlias tablet_alias = 5;
+}
+
+// ReleaseRequest is the payload to Release
+message ReleaseRequest {
+  vtrpc.CallerID effective_caller_id = 1;
+  VTGateCallerID immediate_caller_id = 2;
+  Target target = 3;
+  int64 transaction_id = 4;
+  int64 reserved_id = 5;
+}
+
+// ReleaseResponse is the returned value from Release
+message ReleaseResponse {
+}
+
 // StreamHealthRequest is the payload for StreamHealth
 message StreamHealthRequest {
 }
@@ -672,8 +760,8 @@ message RealtimeStats {
   // we do not send queries to servers that are not healthy.
   string health_error = 1;
 
-  // seconds_behind_master is populated for slaves only. It indicates
-  // how far behind on (MySQL) replication a slave currently is.  It is used
+  // seconds_behind_master is populated for replicas only. It indicates
+  // how far behind on (MySQL) replication a replica currently is.  It is used
   // by clients for subset selection (so we don't try to send traffic
   // to tablets that are too far behind).
   // NOTE: This field must not be evaluated if "health_error" is not empty.
@@ -699,6 +787,9 @@ message RealtimeStats {
   // qps is the average QPS (queries per second) rate in the last XX seconds
   // where XX is usually 60 (See query_service_stats.go).
   double qps = 6;
+
+  // table_schema_changed is to provide list of tables that have schema changes detected by the tablet.
+  repeated string table_schema_changed = 7;
 }
 
 // AggregateStats contains information about the health of a group of

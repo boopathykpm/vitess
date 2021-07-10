@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"vitess.io/vitess/go/vt/logz"
@@ -56,12 +57,12 @@ func (e *Executor) gatherScatterStats() (statsResults, error) {
 	totalExecTime := time.Duration(0)
 	totalCount := uint64(0)
 
+	var err error
 	plans := make([]*engine.Plan, 0)
 	routes := make([]*engine.Route, 0)
 	// First we go over all plans and collect statistics and all query plans for scatter queries
-	for _, item := range e.plans.Items() {
-		plan := item.Value.(*engine.Plan)
-
+	e.plans.ForEach(func(value interface{}) bool {
+		plan := value.(*engine.Plan)
 		scatter := engine.Find(findScatter, plan.Instructions)
 		readOnly := !engine.Exists(isUpdating, plan.Instructions)
 		isScatter := scatter != nil
@@ -69,35 +70,47 @@ func (e *Executor) gatherScatterStats() (statsResults, error) {
 		if isScatter {
 			route, isRoute := scatter.(*engine.Route)
 			if !isRoute {
-				return statsResults{}, vterrors.Errorf(vtrpc.Code_INTERNAL, "expected a route, but found a %v", scatter)
+				err = vterrors.Errorf(vtrpc.Code_INTERNAL, "expected a route, but found a %v", scatter)
+				return false
 			}
 			plans = append(plans, plan)
 			routes = append(routes, route)
-			scatterExecTime += plan.ExecTime
-			scatterCount += plan.ExecCount
+			scatterExecTime += time.Duration(atomic.LoadUint64(&plan.ExecTime))
+			scatterCount += atomic.LoadUint64(&plan.ExecCount)
 		}
 		if readOnly {
-			readOnlyTime += plan.ExecTime
-			readOnlyCount += plan.ExecCount
+			readOnlyTime += time.Duration(atomic.LoadUint64(&plan.ExecTime))
+			readOnlyCount += atomic.LoadUint64(&plan.ExecCount)
 		}
 
-		totalExecTime += plan.ExecTime
-		totalCount += plan.ExecCount
+		totalExecTime += time.Duration(atomic.LoadUint64(&plan.ExecTime))
+		totalCount += atomic.LoadUint64(&plan.ExecCount)
+		return true
+	})
+	if err != nil {
+		return statsResults{}, err
 	}
 
 	// Now we'll go over all scatter queries we've found and produce result items for each
 	resultItems := make([]*statsResultItem, len(plans))
 	for i, plan := range plans {
 		route := routes[i]
+		execCount := atomic.LoadUint64(&plan.ExecCount)
+		execTime := time.Duration(atomic.LoadUint64(&plan.ExecTime))
+
+		var avgTimePerQuery int64
+		if execCount != 0 {
+			avgTimePerQuery = execTime.Nanoseconds() / int64(execCount)
+		}
 		resultItems[i] = &statsResultItem{
 			Query:                  plan.Original,
-			AvgTimePerQuery:        time.Duration(plan.ExecTime.Nanoseconds() / int64(plan.ExecCount)),
-			PercentTimeOfReads:     float64(100 * plan.ExecTime / readOnlyTime),
-			PercentTimeOfScatters:  float64(100 * plan.ExecTime / scatterExecTime),
-			PercentCountOfReads:    float64(100 * plan.ExecCount / readOnlyCount),
-			PercentCountOfScatters: float64(100 * plan.ExecCount / scatterCount),
+			AvgTimePerQuery:        time.Duration(avgTimePerQuery),
+			PercentTimeOfReads:     100 * float64(execTime) / float64(readOnlyTime),
+			PercentTimeOfScatters:  100 * float64(execTime) / float64(scatterExecTime),
+			PercentCountOfReads:    100 * float64(execCount) / float64(readOnlyCount),
+			PercentCountOfScatters: 100 * float64(execCount) / float64(scatterCount),
 			From:                   route.Keyspace.Name + "." + route.TableName,
-			Count:                  plan.ExecCount,
+			Count:                  execCount,
 		}
 	}
 	result := statsResults{
@@ -121,7 +134,7 @@ func (e *Executor) WriteScatterStats(w http.ResponseWriter) {
 	}
 
 	t := template.New("template")
-	t, err = t.Parse(html)
+	t, err = t.Parse(statsHTML)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -140,7 +153,7 @@ func (e *Executor) WriteScatterStats(w http.ResponseWriter) {
 
 }
 
-const html = `
+const statsHTML = `
 <thead>
 	<tr>
 		<th>Query</th>

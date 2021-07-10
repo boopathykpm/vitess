@@ -19,6 +19,7 @@ limitations under the License.
 package grpcclient
 
 import (
+	"context"
 	"flag"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+
 	"vitess.io/vitess/go/trace"
 
 	"vitess.io/vitess/go/vt/grpccommon"
@@ -36,10 +38,10 @@ import (
 )
 
 var (
-	keepaliveTime         = flag.Duration("grpc_keepalive_time", 10*time.Second, "After a duration of this time if the client doesn't see any activity it pings the server to see if the transport is still alive.")
+	keepaliveTime         = flag.Duration("grpc_keepalive_time", 10*time.Second, "After a duration of this time, if the client doesn't see any activity, it pings the server to see if the transport is still alive.")
 	keepaliveTimeout      = flag.Duration("grpc_keepalive_timeout", 10*time.Second, "After having pinged for keepalive check, the client waits for a duration of Timeout and if no activity is seen even after that the connection is closed.")
-	initialConnWindowSize = flag.Int("grpc_initial_conn_window_size", 0, "grpc initial connection window size")
-	initialWindowSize     = flag.Int("grpc_initial_window_size", 0, "grpc initial window size")
+	initialConnWindowSize = flag.Int("grpc_initial_conn_window_size", 0, "gRPC initial connection window size")
+	initialWindowSize     = flag.Int("grpc_initial_window_size", 0, "gRPC initial window size")
 )
 
 // FailFast is a self-documenting type for the grpc.FailFast.
@@ -57,12 +59,22 @@ func RegisterGRPCDialOptions(grpcDialOptionsFunc func(opts []grpc.DialOption) ([
 // failFast is a non-optional parameter because callers are required to specify
 // what that should be.
 func Dial(target string, failFast FailFast, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	return DialContext(context.Background(), target, failFast, opts...)
+}
+
+// DialContext creates a grpc connection to the given target. Setup steps are
+// covered by the context deadline, and, if WithBlock is specified in the dial
+// options, connection establishment steps are covered by the context as well.
+//
+// failFast is a non-optional parameter because callers are required to specify
+// what that should be.
+func DialContext(ctx context.Context, target string, failFast FailFast, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	grpccommon.EnableTracingOpt()
 	newopts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(*grpccommon.MaxMessageSize),
 			grpc.MaxCallSendMsgSize(*grpccommon.MaxMessageSize),
-			grpc.FailFast(bool(failFast)),
+			grpc.WaitForReady(bool(!failFast)),
 		),
 	}
 
@@ -97,7 +109,7 @@ func Dial(target string, failFast FailFast, opts ...grpc.DialOption) (*grpc.Clie
 
 	newopts = append(newopts, interceptors()...)
 
-	return grpc.Dial(target, newopts...)
+	return grpc.DialContext(ctx, target, newopts...)
 }
 
 func interceptors() []grpc.DialOption {

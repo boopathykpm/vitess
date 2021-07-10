@@ -18,6 +18,9 @@ package engine
 
 import (
 	"encoding/json"
+	"fmt"
+
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
@@ -109,7 +112,7 @@ func (vf *VindexFunc) mapVindex(vcursor VCursor, bindVars map[string]*querypb.Bi
 	if err != nil {
 		return nil, err
 	}
-	vkey, err := sqltypes.Cast(k, sqltypes.VarBinary)
+	vkey, err := evalengine.Cast(k, sqltypes.VarBinary)
 	if err != nil {
 		return nil, err
 	}
@@ -125,20 +128,31 @@ func (vf *VindexFunc) mapVindex(vcursor VCursor, bindVars map[string]*querypb.Bi
 	case key.DestinationKeyRange:
 		if d.KeyRange != nil {
 			result.Rows = append(result.Rows, vf.buildRow(vkey, nil, d.KeyRange))
-			result.RowsAffected = 1
 		}
 	case key.DestinationKeyspaceID:
 		if len(d) > 0 {
-			result.Rows = [][]sqltypes.Value{
-				vf.buildRow(vkey, d, nil),
+			if vcursor != nil {
+				resolvedShards, _, err := vcursor.ResolveDestinations(vcursor.GetKeyspace(), nil, []key.Destination{d})
+				if err != nil {
+					return nil, err
+				}
+				kr, err := key.ParseShardingSpec(resolvedShards[0].Target.Shard)
+				if err != nil {
+					return nil, err
+				}
+				result.Rows = [][]sqltypes.Value{
+					vf.buildRow(vkey, d, kr[0]),
+				}
+			} else {
+				result.Rows = [][]sqltypes.Value{
+					vf.buildRow(vkey, d, nil),
+				}
 			}
-			result.RowsAffected = 1
 		}
 	case key.DestinationKeyspaceIDs:
 		for _, ksid := range d {
 			result.Rows = append(result.Rows, vf.buildRow(vkey, ksid, nil))
 		}
-		result.RowsAffected = uint64(len(d))
 	case key.DestinationNone:
 		// Nothing to do.
 	default:
@@ -171,6 +185,18 @@ func (vf *VindexFunc) buildRow(id sqltypes.Value, ksid []byte, kr *topodatapb.Ke
 			} else {
 				row = append(row, sqltypes.NULL)
 			}
+		case 4:
+			if ksid != nil {
+				row = append(row, sqltypes.NewVarBinary(fmt.Sprintf("%x", ksid)))
+			} else {
+				row = append(row, sqltypes.NULL)
+			}
+		case 5:
+			if ksid != nil {
+				row = append(row, sqltypes.NewVarBinary(key.KeyRangeString(kr)))
+			} else {
+				row = append(row, sqltypes.NULL)
+			}
 		default:
 			panic("BUG: unexpected column number")
 		}
@@ -179,5 +205,23 @@ func (vf *VindexFunc) buildRow(id sqltypes.Value, ksid []byte, kr *topodatapb.Ke
 }
 
 func (vf *VindexFunc) description() PrimitiveDescription {
-	return PrimitiveDescription{OperatorType: "vindexfunc - not implemented"}
+	fields := map[string]string{}
+	for _, field := range vf.Fields {
+		fields[field.Name] = field.Type.String()
+	}
+
+	other := map[string]interface{}{
+		"Fields":  fields,
+		"Columns": vf.Cols,
+		"Value":   vf.Value,
+	}
+	if vf.Vindex != nil {
+		other["Vindex"] = vf.Vindex.String()
+	}
+
+	return PrimitiveDescription{
+		OperatorType: "VindexFunc",
+		Variant:      vindexOpcodeName[vf.Opcode],
+		Other:        other,
+	}
 }

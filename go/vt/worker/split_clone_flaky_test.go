@@ -26,7 +26,12 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/discovery"
+
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
+	"context"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
@@ -37,7 +42,6 @@ import (
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vttablet/grpcqueryservice"
 	"vitess.io/vitess/go/vt/vttablet/queryservice/fakes"
-	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler/testlib"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -188,7 +192,7 @@ func (tc *splitCloneTestCase) setUpWithConcurrency(v3 bool, concurrency, writeQu
 	if err := tc.wi.wr.SetKeyspaceShardingInfo(ctx, "ks", "keyspace_id", topodatapb.KeyspaceIdType_UINT64, false); err != nil {
 		tc.t.Fatalf("SetKeyspaceShardingInfo failed: %v", err)
 	}
-	if err := tc.wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil); err != nil {
+	if err := tc.wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil, false); err != nil {
 		tc.t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
 
@@ -211,8 +215,8 @@ func (tc *splitCloneTestCase) setUpWithConcurrency(v3 bool, concurrency, writeQu
 				},
 			},
 		}
-		sourceRdonly.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-			GTIDSet: mysql.MariadbGTIDSet{mysql.MariadbGTID{Domain: 12, Server: 34, Sequence: 5678}},
+		sourceRdonly.FakeMysqlDaemon.CurrentPrimaryPosition = mysql.Position{
+			GTIDSet: mysql.MariadbGTIDSet{12: mysql.MariadbGTID{Domain: 12, Server: 34, Sequence: 5678}},
 		}
 		sourceRdonly.FakeMysqlDaemon.ExpectedExecuteSuperQueryList = []string{
 			"STOP SLAVE",
@@ -292,7 +296,7 @@ func (tc *splitCloneTestCase) tearDown() {
 		ft.StopActionLoop(tc.t)
 		ft.RPCServer.Stop()
 		ft.FakeMysqlDaemon.Close()
-		ft.Agent = nil
+		ft.TM = nil
 		ft.RPCServer = nil
 		ft.FakeMysqlDaemon = nil
 	}
@@ -306,7 +310,7 @@ type testQueryService struct {
 	t *testing.T
 
 	// target is used in the log output.
-	target querypb.Target
+	target *querypb.Target
 	*fakes.StreamHealthQueryService
 	shardIndex int
 	shardCount int
@@ -328,21 +332,22 @@ type testQueryService struct {
 	errorCallback func()
 }
 
-func newTestQueryService(t *testing.T, target querypb.Target, shqs *fakes.StreamHealthQueryService, shardIndex, shardCount int, alias string, omitKeyspaceID bool) *testQueryService {
+func newTestQueryService(t *testing.T, target *querypb.Target, shqs *fakes.StreamHealthQueryService, shardIndex, shardCount int, alias string, omitKeyspaceID bool) *testQueryService {
 	fields := v2Fields
 	if omitKeyspaceID {
 		fields = v3Fields
 	}
 	return &testQueryService{
-		t:                        t,
-		target:                   target,
+		t:              t,
+		target:         target,
+		shardIndex:     shardIndex,
+		shardCount:     shardCount,
+		alias:          alias,
+		omitKeyspaceID: omitKeyspaceID,
+		fields:         fields,
+		forceError:     make(map[int64]int),
+
 		StreamHealthQueryService: shqs,
-		shardIndex:               shardIndex,
-		shardCount:               shardCount,
-		alias:                    alias,
-		omitKeyspaceID:           omitKeyspaceID,
-		fields:                   fields,
-		forceError:               make(map[int64]int),
 	}
 }
 
@@ -391,7 +396,7 @@ func (sq *testQueryService) StreamExecute(ctx context.Context, target *querypb.T
 	// Send the values.
 	rowsAffected := 0
 	for _, row := range sq.rows {
-		v, _ := sqltypes.ToNative(row[0])
+		v, _ := evalengine.ToNative(row[0])
 		primaryKey := v.(int64)
 
 		if primaryKey >= int64(min) && primaryKey < int64(max) {
@@ -520,6 +525,12 @@ var v3Fields = []*querypb.Field{
 
 // TestSplitCloneV2_Offline tests the offline phase with an empty destination.
 func TestSplitCloneV2_Offline(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -535,6 +546,12 @@ func TestSplitCloneV2_Offline(t *testing.T) {
 // --source_reader_count=10, at most 10 out of the 1000 chunk pipeplines will
 // get processed concurrently while the other pending ones are blocked.
 func TestSplitCloneV2_Offline_HighChunkCount(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUpWithConcurrency(false /* v3 */, 10, 5 /* writeQueryMaxRows */, 1000 /* rowsCount */)
 	defer tc.tearDown()
@@ -558,6 +575,12 @@ func TestSplitCloneV2_Offline_HighChunkCount(t *testing.T) {
 // TestSplitCloneV2_Offline but forces SplitClone to restart the streaming
 // query on the source before reading the last row.
 func TestSplitCloneV2_Offline_RestartStreamingQuery(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -599,6 +622,12 @@ func TestSplitCloneV2_Offline_RestartStreamingQuery(t *testing.T) {
 // TestSplitCloneV2_Offline_RestartStreamingQuery. However, the first restart
 // of the streaming query does not succeed here and instead vtworker will fail.
 func TestSplitCloneV2_Offline_FailOverStreamingQuery_NotAllowed(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUpWithConcurrency(false /* v3 */, 1, 10, splitCloneTestRowsCount)
 	defer tc.tearDown()
@@ -639,6 +668,12 @@ func TestSplitCloneV2_Offline_FailOverStreamingQuery_NotAllowed(t *testing.T) {
 // query on the source *and* failover to a different source tablet before
 // reading the last row.
 func TestSplitCloneV2_Online_FailOverStreamingQuery(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUpWithConcurrency(false /* v3 */, 1, 10, splitCloneTestRowsCount)
 	defer tc.tearDown()
@@ -694,6 +729,12 @@ func TestSplitCloneV2_Online_FailOverStreamingQuery(t *testing.T) {
 // restartable_result_reader.go where we keep retrying while no tablet may be
 // available.
 func TestSplitCloneV2_Online_TabletsUnavailableDuringRestart(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUpWithConcurrency(false /* v3 */, 1, 10, splitCloneTestRowsCount)
 	defer tc.tearDown()
@@ -742,6 +783,11 @@ func TestSplitCloneV2_Online_TabletsUnavailableDuringRestart(t *testing.T) {
 
 // TestSplitCloneV2_Online tests the online phase with an empty destination.
 func TestSplitCloneV2_Online(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -767,6 +813,12 @@ func TestSplitCloneV2_Online(t *testing.T) {
 }
 
 func TestSplitCloneV2_Online_Offline(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -799,6 +851,12 @@ func TestSplitCloneV2_Online_Offline(t *testing.T) {
 // TestSplitCloneV2_Offline, but the destination has existing data which must be
 // reconciled.
 func TestSplitCloneV2_Offline_Reconciliation(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	// We reduce the parallelism to 1 to test the order of expected
 	// insert/update/delete statements on the destination master.
@@ -859,6 +917,12 @@ func TestSplitCloneV2_Offline_Reconciliation(t *testing.T) {
 }
 
 func TestSplitCloneV2_Throttled(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -900,6 +964,12 @@ func TestSplitCloneV2_Throttled(t *testing.T) {
 // TestSplitCloneV2 with the additional twist that the destination masters
 // fail the first write because they are read-only and succeed after that.
 func TestSplitCloneV2_RetryDueToReadonly(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -926,70 +996,16 @@ func TestSplitCloneV2_RetryDueToReadonly(t *testing.T) {
 	}
 }
 
-// TestSplitCloneV2_RetryDueToReparent tests that vtworker correctly failovers
-// during a reparent.
-// NOTE: worker.py is an end-to-end test which tests this as well.
-func TestSplitCloneV2_RetryDueToReparent(t *testing.T) {
-	tc := &splitCloneTestCase{t: t}
-	tc.setUp(false /* v3 */)
-	defer tc.tearDown()
-
-	// Only wait 1 ms between retries, so that the test passes faster.
-	*executeFetchRetryTime = 1 * time.Millisecond
-
-	// Provoke a reparent just before the copy finishes.
-	// leftReplica will take over for the last, 30th, insert and the vreplication checkpoint.
-	tc.leftReplicaFakeDb.AddExpectedQuery("INSERT INTO `vt_ks`.`table1` (`id`, `msg`, `keyspace_id`) VALUES (*", nil)
-
-	// Do not let leftMaster succeed the 30th write.
-	tc.leftMasterFakeDb.DeleteAllEntriesAfterIndex(28)
-	tc.leftMasterFakeDb.AddExpectedQuery("INSERT INTO `vt_ks`.`table1` (`id`, `msg`, `keyspace_id`) VALUES (*", errReadOnly)
-	tc.leftMasterFakeDb.EnableInfinite()
-	// When vtworker encounters the readonly error on leftMaster, do the reparent.
-	tc.leftMasterFakeDb.GetEntry(29).AfterFunc = func() {
-		// Reparent from leftMaster to leftReplica.
-		// NOTE: This step is actually not necessary due to our fakes which bypass
-		//       a lot of logic. Let's keep it for correctness though.
-		ti, err := tc.ts.GetTablet(context.Background(), tc.leftReplica.Tablet.Alias)
-		if err != nil {
-			t.Fatalf("GetTablet failed: %v", err)
-		}
-		tmc := tmclient.NewTabletManagerClient()
-		if err := tmc.TabletExternallyReparented(context.Background(), ti.Tablet, "wait id 1"); err != nil {
-			t.Fatalf("TabletExternallyReparented(replica) failed: %v", err)
-		}
-
-		// Update targets in fake query service and send out a new health response.
-		tc.leftMasterQs.UpdateType(topodatapb.TabletType_REPLICA)
-		tc.leftMasterQs.AddDefaultHealthResponse()
-		tc.leftReplicaQs.UpdateType(topodatapb.TabletType_MASTER)
-		tc.leftReplicaQs.AddDefaultHealthResponse()
-
-		// After this, vtworker will retry. The following situations can occur:
-		// 1. HealthCheck picked up leftReplica as new MASTER
-		//    => retry will succeed.
-		// 2. HealthCheck picked up no changes (leftMaster remains MASTER)
-		//    => retry will hit leftMaster which keeps responding with readonly err.
-		// 3. HealthCheck picked up leftMaster as REPLICA, but leftReplica is still
-		//    a REPLICA.
-		//    => vtworker has no MASTER to go to and will keep retrying.
-	}
-
-	// Run the vtworker command.
-	if err := runCommand(t, tc.wi, tc.wi.wr, tc.defaultWorkerArgs); err != nil {
-		t.Fatal(err)
-	}
-
-	wantRetryCountMin := int64(1)
-	if got := statsRetryCount.Get(); got < wantRetryCountMin {
-		t.Errorf("Wrong statsRetryCounter: got %v, wanted >= %v", got, wantRetryCountMin)
-	}
-}
-
 // TestSplitCloneV2_NoMasterAvailable tests that vtworker correctly retries
 // even in a period where no MASTER tablet is available according to the
 // HealthCheck instance.
 func TestSplitCloneV2_NoMasterAvailable(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(false /* v3 */)
 	defer tc.tearDown()
@@ -1044,7 +1060,7 @@ func TestSplitCloneV2_NoMasterAvailable(t *testing.T) {
 		}
 
 		// Make leftReplica the new MASTER.
-		tc.leftReplica.Agent.TabletExternallyReparented(ctx, "1")
+		tc.leftReplica.TM.ChangeType(ctx, topodatapb.TabletType_MASTER)
 		t.Logf("resetting tablet back to MASTER")
 		tc.leftReplicaQs.UpdateType(topodatapb.TabletType_MASTER)
 		tc.leftReplicaQs.AddDefaultHealthResponse()
@@ -1057,6 +1073,12 @@ func TestSplitCloneV2_NoMasterAvailable(t *testing.T) {
 }
 
 func TestSplitCloneV3(t *testing.T) {
+	delay := discovery.GetTabletPickerRetryDelay()
+	defer func() {
+		discovery.SetTabletPickerRetryDelay(delay)
+	}()
+	discovery.SetTabletPickerRetryDelay(5 * time.Millisecond)
+
 	tc := &splitCloneTestCase{t: t}
 	tc.setUp(true /* v3 */)
 	defer tc.tearDown()

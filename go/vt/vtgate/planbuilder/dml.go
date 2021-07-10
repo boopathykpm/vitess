@@ -48,11 +48,15 @@ func getDMLRouting(where *sqlparser.Where, table *vindexes.Table) (engine.DMLOpc
 		}
 
 		if pv, ok := getMatch(where.Expr, index.Columns[0]); ok {
-			return engine.Equal, ksidVindex, ksidCol, single, []sqltypes.PlanValue{pv}, nil
+			opcode := engine.Equal
+			if pv.IsList() {
+				opcode = engine.In
+			}
+			return opcode, ksidVindex, ksidCol, single, []sqltypes.PlanValue{pv}, nil
 		}
 	}
 	if ksidVindex == nil {
-		return engine.Scatter, nil, "", nil, nil, vterrors.New(vtrpcpb.Code_INTERNAL, "table without a primary vindex is not expected")
+		return engine.Scatter, nil, "", nil, nil, vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.RequiresPrimaryKey, vterrors.PrimaryVindexNotSet, table.Name)
 	}
 	return engine.Scatter, ksidVindex, ksidCol, nil, nil, nil
 }
@@ -61,7 +65,7 @@ func getDMLRouting(where *sqlparser.Where, table *vindexes.Table) (engine.DMLOpc
 // constraint on the specified column that can be used to
 // decide on a route.
 func getMatch(node sqlparser.Expr, col sqlparser.ColIdent) (pv sqltypes.PlanValue, ok bool) {
-	filters := splitAndExpression(nil, node)
+	filters := sqlparser.SplitAndExpression(nil, node)
 	for _, filter := range filters {
 		comparison, ok := filter.(*sqlparser.ComparisonExpr)
 		if !ok {
@@ -71,8 +75,12 @@ func getMatch(node sqlparser.Expr, col sqlparser.ColIdent) (pv sqltypes.PlanValu
 			continue
 		}
 		switch comparison.Operator {
-		case sqlparser.EqualStr:
+		case sqlparser.EqualOp:
 			if !sqlparser.IsValue(comparison.Right) {
+				continue
+			}
+		case sqlparser.InOp:
+			if !sqlparser.IsSimpleTuple(comparison.Right) {
 				continue
 			}
 		default:
@@ -92,76 +100,79 @@ func nameMatch(node sqlparser.Expr, col sqlparser.ColIdent) bool {
 	return ok && colname.Name.Equal(col)
 }
 
-func buildDMLPlan(vschema ContextVSchema, dmlType string, stmt sqlparser.Statement, tableExprs sqlparser.TableExprs, where *sqlparser.Where, orderBy sqlparser.OrderBy, limit *sqlparser.Limit, comments sqlparser.Comments, nodes ...sqlparser.SQLNode) (*engine.DML, vindexes.SingleColumn, string, error) {
-	eupd := &engine.DML{}
-	pb := newPrimitiveBuilder(vschema, newJointab(sqlparser.GetBindvars(stmt)))
-	ro, err := pb.processDMLTable(tableExprs)
+func buildDMLPlan(vschema ContextVSchema, dmlType string, stmt sqlparser.Statement, reservedVars *sqlparser.ReservedVars, tableExprs sqlparser.TableExprs, where *sqlparser.Where, orderBy sqlparser.OrderBy, limit *sqlparser.Limit, comments sqlparser.Comments, nodes ...sqlparser.SQLNode) (*engine.DML, vindexes.SingleColumn, string, error) {
+	edml := &engine.DML{}
+	pb := newPrimitiveBuilder(vschema, newJointab(reservedVars))
+	rb, err := pb.processDMLTable(tableExprs, reservedVars, nil)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	eupd.Keyspace = ro.eroute.Keyspace
-	if !eupd.Keyspace.Sharded {
+	edml.Keyspace = rb.eroute.Keyspace
+	if !edml.Keyspace.Sharded {
 		// We only validate non-table subexpressions because the previous analysis has already validated them.
 		var subqueryArgs []sqlparser.SQLNode
 		subqueryArgs = append(subqueryArgs, nodes...)
 		subqueryArgs = append(subqueryArgs, where, orderBy, limit)
-		if !pb.finalizeUnshardedDMLSubqueries(subqueryArgs...) {
+		if pb.finalizeUnshardedDMLSubqueries(reservedVars, subqueryArgs...) {
+			vschema.WarnUnshardedOnly("subqueries can't be sharded in DML")
+		} else {
 			return nil, nil, "", vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: sharded subqueries in DML")
 		}
-		eupd.Opcode = engine.Unsharded
+		edml.Opcode = engine.Unsharded
 		// Generate query after all the analysis. Otherwise table name substitutions for
 		// routed tables won't happen.
-		eupd.Query = generateQuery(stmt)
-		return eupd, nil, "", nil
+		edml.Query = generateQuery(stmt)
+		return edml, nil, "", nil
 	}
 
 	if hasSubquery(stmt) {
 		return nil, nil, "", vterrors.New(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: subqueries in sharded DML")
 	}
 
-	if len(pb.st.tables) != 1 {
-		return nil, nil, "", vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: multi-table %s statement in sharded keyspace", dmlType)
-	}
-
 	// Generate query after all the analysis. Otherwise table name substitutions for
 	// routed tables won't happen.
-	eupd.Query = generateQuery(stmt)
+	edml.Query = generateQuery(stmt)
 
 	directives := sqlparser.ExtractCommentDirectives(comments)
 	if directives.IsSet(sqlparser.DirectiveMultiShardAutocommit) {
-		eupd.MultiShardAutocommit = true
+		edml.MultiShardAutocommit = true
 	}
 
-	eupd.QueryTimeout = queryTimeout(directives)
-	eupd.Table = ro.vschemaTable
-	if eupd.Table == nil {
-		return nil, nil, "", vterrors.New(vtrpcpb.Code_INTERNAL, "internal error: table.vindexTable is mysteriously nil")
+	edml.QueryTimeout = queryTimeout(directives)
+
+	if len(pb.st.tables) != 1 {
+		return nil, nil, "", vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "multi-table %s statement is not supported in sharded database", dmlType)
+	}
+	for _, tval := range pb.st.tables {
+		// There is only one table.
+		edml.Table = tval.vschemaTable
 	}
 
-	if ro.eroute.TargetDestination != nil {
-		if ro.eroute.TargetTabletType != topodatapb.TabletType_MASTER {
-			return nil, nil, "", vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unsupported: %s statement with a replica target", dmlType)
-		}
-		eupd.Opcode = engine.ByDestination
-		eupd.TargetDestination = ro.eroute.TargetDestination
-		return eupd, nil, "", nil
-	}
-
-	routingType, ksidVindex, ksidCol, vindex, values, err := getDMLRouting(where, eupd.Table)
+	routingType, ksidVindex, ksidCol, vindex, values, err := getDMLRouting(where, edml.Table)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	eupd.Opcode = routingType
-	if routingType == engine.Scatter {
-		if limit != nil {
-			return nil, nil, "", vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "unsupported: multi shard %s with limit", dmlType)
+
+	if rb.eroute.TargetDestination != nil {
+		if rb.eroute.TargetTabletType != topodatapb.TabletType_MASTER {
+			return nil, nil, "", vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.InnodbReadOnly, "unsupported: %s statement with a replica target", dmlType)
 		}
-	} else {
-		eupd.Vindex = vindex
-		eupd.Values = values
+		edml.Opcode = engine.ByDestination
+		edml.TargetDestination = rb.eroute.TargetDestination
+		return edml, ksidVindex, ksidCol, nil
 	}
 
-	return eupd, ksidVindex, ksidCol, nil
+	edml.Opcode = routingType
+	if routingType == engine.Scatter {
+		if limit != nil {
+			return nil, nil, "", vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "multi shard %s with limit is not supported", dmlType)
+		}
+	} else {
+		edml.Vindex = vindex
+		edml.Values = values
+	}
+
+	return edml, ksidVindex, ksidCol, nil
 }
 
 func generateDMLSubquery(where *sqlparser.Where, orderBy sqlparser.OrderBy, limit *sqlparser.Limit, table *vindexes.Table, ksidCol string) string {

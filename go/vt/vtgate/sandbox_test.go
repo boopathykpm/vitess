@@ -21,7 +21,8 @@ import (
 	"fmt"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/key"
@@ -233,7 +234,7 @@ func (sct *sandboxTopo) GetTopoServer() (*topo.Server, error) {
 }
 
 // GetSrvKeyspaceNames is part of the srvtopo.Server interface.
-func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error) {
+func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error) {
 	sandboxMu.Lock()
 	defer sandboxMu.Unlock()
 	keyspaces := make([]string, 0, 1)

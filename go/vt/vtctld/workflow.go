@@ -20,12 +20,12 @@ import (
 	"flag"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/trace"
 
 	"vitess.io/vitess/go/flagutil"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/schemamanager/schemaswap"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vtctl"
@@ -54,9 +54,6 @@ func initWorkflowManager(ts *topo.Server) {
 		topovalidator.RegisterKeyspaceValidator()
 		topovalidator.RegisterShardValidator()
 		topovalidator.Register()
-
-		// Register the Schema Swap workflow.
-		schemaswap.RegisterWorkflowFactory()
 
 		// Register the Horizontal Resharding workflow.
 		resharding.Register()

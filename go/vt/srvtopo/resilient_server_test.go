@@ -25,8 +25,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"context"
+
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/status"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
@@ -302,19 +304,25 @@ func TestGetSrvKeyspace(t *testing.T) {
 
 	// Force another error and lock the topo. Then wait for the TTL to
 	// expire and verify that the context timeout unblocks the request.
-	forceErr = fmt.Errorf("force long test error")
-	factory.SetError(forceErr)
-	factory.Lock()
 
-	time.Sleep(*srvTopoCacheTTL)
+	// TODO(deepthi): Commenting out this test until we fix https://github.com/vitessio/vitess/issues/6134
 
-	timeoutCtx, _ := context.WithTimeout(context.Background(), *srvTopoCacheRefresh*2)
-	_, err = rs.GetSrvKeyspace(timeoutCtx, "test_cell", "test_ks")
-	wantErr := "timed out waiting for keyspace"
-	if err == nil || err.Error() != wantErr {
-		t.Errorf("expected error '%v', got '%v'", wantErr, err)
-	}
-	factory.Unlock()
+	/*
+		forceErr = fmt.Errorf("force long test error")
+		factory.SetError(forceErr)
+		factory.Lock()
+
+		time.Sleep(*srvTopoCacheTTL)
+
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), *srvTopoCacheRefresh*2) //nolint
+		defer cancel()
+		_, err = rs.GetSrvKeyspace(timeoutCtx, "test_cell", "test_ks")
+		wantErr := "timed out waiting for keyspace"
+		if err == nil || err.Error() != wantErr {
+			t.Errorf("expected error '%v', got '%v'", wantErr, err)
+		}
+		factory.Unlock()
+	*/
 }
 
 // TestSrvKeyspaceCachedError will test we properly re-try to query
@@ -498,7 +506,7 @@ func TestGetSrvKeyspaceNames(t *testing.T) {
 	ts.UpdateSrvKeyspace(context.Background(), "test_cell", "test_ks2", want)
 
 	ctx := context.Background()
-	names, err := rs.GetSrvKeyspaceNames(ctx, "test_cell")
+	names, err := rs.GetSrvKeyspaceNames(ctx, "test_cell", false)
 	if err != nil {
 		t.Errorf("GetSrvKeyspaceNames unexpected error %v", err)
 	}
@@ -523,7 +531,7 @@ func TestGetSrvKeyspaceNames(t *testing.T) {
 	// elapses but before the TTL expires
 	start := time.Now()
 	for {
-		names, err = rs.GetSrvKeyspaceNames(ctx, "test_cell")
+		names, err = rs.GetSrvKeyspaceNames(ctx, "test_cell", false)
 		if err != nil {
 			t.Errorf("GetSrvKeyspaceNames unexpected error %v", err)
 		}
@@ -541,7 +549,7 @@ func TestGetSrvKeyspaceNames(t *testing.T) {
 
 	// Now wait for it to expire from cache
 	for {
-		_, err = rs.GetSrvKeyspaceNames(ctx, "test_cell")
+		_, err = rs.GetSrvKeyspaceNames(ctx, "test_cell", false)
 		if err != nil {
 			break
 		}
@@ -557,6 +565,20 @@ func TestGetSrvKeyspaceNames(t *testing.T) {
 		t.Errorf("got error %v want %v", err, forceErr)
 	}
 
+	// Now, since the TTL has expired, check that when we ask for stale
+	// info, we'll get it.
+	_, err = rs.GetSrvKeyspaceNames(ctx, "test_cell", true)
+	if err != nil {
+		t.Fatalf("expected no error if asking for stale cache data")
+	}
+
+	// Now, wait long enough that with a stale ask, we'll get an error
+	time.Sleep(*srvTopoCacheRefresh*2 + 2*time.Millisecond)
+	_, err = rs.GetSrvKeyspaceNames(ctx, "test_cell", true)
+	if err != forceErr {
+		t.Fatalf("expected an error if asking for really stale cache data")
+	}
+
 	// Check that we only checked the topo service 1 or 2 times during the
 	// period where we got the cached error.
 	cachedReqs, ok := rs.counts.Counts()[cachedCategory]
@@ -569,7 +591,7 @@ func TestGetSrvKeyspaceNames(t *testing.T) {
 
 	start = time.Now()
 	for {
-		names, err = rs.GetSrvKeyspaceNames(ctx, "test_cell")
+		names, err = rs.GetSrvKeyspaceNames(ctx, "test_cell", false)
 		if err == nil {
 			break
 		}
@@ -598,8 +620,9 @@ func TestGetSrvKeyspaceNames(t *testing.T) {
 
 	time.Sleep(*srvTopoCacheTTL)
 
-	timeoutCtx, _ := context.WithTimeout(context.Background(), *srvTopoCacheRefresh*2)
-	_, err = rs.GetSrvKeyspaceNames(timeoutCtx, "test_cell")
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), *srvTopoCacheRefresh*2) //nolint
+	defer cancel()
+	_, err = rs.GetSrvKeyspaceNames(timeoutCtx, "test_cell", false)
 	wantErr := "timed out waiting for keyspace names"
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("expected error '%v', got '%v'", wantErr, err.Error())

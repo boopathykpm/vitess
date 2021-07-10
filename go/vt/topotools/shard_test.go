@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
@@ -105,7 +105,8 @@ func TestGetOrCreateShard(t *testing.T) {
 	ctx := context.Background()
 
 	// Set up topology.
-	ts := memorytopo.NewServer("test_cell")
+	cell := "test_cell"
+	ts := memorytopo.NewServer(cell)
 
 	// and do massive parallel GetOrCreateShard
 	keyspace := "test_keyspace"

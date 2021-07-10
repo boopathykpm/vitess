@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"io"
 
-	"golang.org/x/net/context"
+	"context"
+
+	"vitess.io/vitess/go/vt/concurrency"
 )
 
 var (
@@ -74,6 +76,10 @@ type BackupHandle interface {
 	// The context is valid for the duration of the reads, until the
 	// ReadCloser is closed.
 	ReadFile(ctx context.Context, filename string) (io.ReadCloser, error)
+
+	// concurrency.ErrorRecorder is embedded here to coordinate reporting and
+	// handling of errors among all the components involved in taking a backup.
+	concurrency.ErrorRecorder
 }
 
 // BackupStorage is the interface to the storage system

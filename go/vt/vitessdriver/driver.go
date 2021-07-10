@@ -24,6 +24,7 @@ import (
 	"errors"
 
 	"google.golang.org/grpc"
+
 	"vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
 )
@@ -85,7 +86,7 @@ func OpenWithConfiguration(c Configuration) (*sql.DB, error) {
 		vtgateconn.RegisterDialer(c.Protocol, grpcvtgateconn.DialWithOpts(context.TODO(), c.GRPCDialOptions...))
 	}
 
-	return sql.Open("vitess", json)
+	return sql.Open(c.DriverName, json)
 }
 
 type drv struct {
@@ -160,6 +161,12 @@ type Configuration struct {
 	//
 	// Default: none
 	GRPCDialOptions []grpc.DialOption `json:"-"`
+
+	// Driver is the name registered with the database/sql package. This override
+	// is here in case you have wrapped the driver for stats or other interceptors.
+	//
+	// Default: "vitess"
+	DriverName string `json:"-"`
 }
 
 // toJSON converts Configuration to the JSON string which is required by the
@@ -179,6 +186,10 @@ func (c *Configuration) setDefaults() {
 	if c.Protocol == "" {
 		c.Protocol = "grpc"
 	}
+
+	if c.DriverName == "" {
+		c.DriverName = "vitess"
+	}
 }
 
 type conn struct {
@@ -196,6 +207,15 @@ func (c *conn) dial() error {
 	}
 	c.session = c.conn.Session(c.Target, nil)
 	return nil
+}
+
+func (c *conn) Ping(ctx context.Context) error {
+	if c.Streaming {
+		return errors.New("Ping not allowed for streaming connections")
+	}
+
+	_, err := c.ExecContext(ctx, "select 1", nil)
+	return err
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {

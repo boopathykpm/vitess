@@ -17,13 +17,19 @@ limitations under the License.
 package vtgate
 
 import (
-	"reflect"
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+
+	"vitess.io/vitess/go/test/utils"
+
+	"github.com/stretchr/testify/require"
+
+	"context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -37,7 +43,7 @@ import (
 
 // This file uses the sandbox_test framework.
 
-var hcVTGateTest *discovery.FakeHealthCheck
+var hcVTGateTest *discovery.FakeLegacyHealthCheck
 
 var executeOptions = &querypb.ExecuteOptions{
 	IncludedFields: querypb.ExecuteOptions_TYPE_ONLY,
@@ -69,12 +75,14 @@ func init() {
 	}
 }
 `
-	hcVTGateTest = discovery.NewFakeHealthCheck()
+	hcVTGateTest = discovery.NewFakeLegacyHealthCheck()
 	*transactionMode = "MULTI"
+	// Use legacy gateway until we can rewrite these tests to use new tabletgateway
+	*GatewayImplementation = GatewayImplementationDiscovery
 	// The topo.Server is used to start watching the cells described
 	// in '-cells_to_watch' command line parameter, which is
 	// empty by default. So it's unused in this test, set to nil.
-	Init(context.Background(), hcVTGateTest, new(sandboxTopo), "aa", 10, nil)
+	LegacyInit(context.Background(), hcVTGateTest, new(sandboxTopo), "aa", 10, nil)
 
 	*mysqlServerPort = 0
 	*mysqlAuthServerImpl = "none"
@@ -98,9 +106,9 @@ func TestVTGateExecute(t *testing.T) {
 	if err != nil {
 		t.Errorf("want nil, got %v", err)
 	}
-	if !reflect.DeepEqual(sandboxconn.SingleRowResult, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	want := *sandboxconn.SingleRowResult
+	want.StatusFlags = 0 // VTGate result set does not contain status flags in sqltypes.Result
+	utils.MustMatch(t, &want, qr)
 	if !proto.Equal(sbc.Options[0], executeOptions) {
 		t.Errorf("got ExecuteOptions \n%+v, want \n%+v", sbc.Options[0], executeOptions)
 	}
@@ -123,9 +131,9 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 	if err != nil {
 		t.Errorf("want nil, got %v", err)
 	}
-	if !reflect.DeepEqual(sandboxconn.SingleRowResult, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	wantQr := *sandboxconn.SingleRowResult
+	wantQr.StatusFlags = 0 // VTGate result set does not contain status flags in sqltypes.Result
+	utils.MustMatch(t, &wantQr, qr)
 
 	// Invalid keyspace.
 	_, _, err = rpcVTGate.Execute(
@@ -136,10 +144,8 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 		"select id from none",
 		nil,
 	)
-	want := "vtgate: : keyspace invalid_keyspace not found in vschema"
-	if err == nil || err.Error() != want {
-		t.Errorf("Execute: %v, want %s", err, want)
-	}
+	want := "Unknown database 'invalid_keyspace' in vschema"
+	assert.EqualError(t, err, want)
 
 	// Valid keyspace/shard.
 	_, qr, err = rpcVTGate.Execute(
@@ -153,9 +159,7 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 	if err != nil {
 		t.Errorf("want nil, got %v", err)
 	}
-	if !reflect.DeepEqual(sandboxconn.SingleRowResult, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, &wantQr, qr)
 
 	// Invalid keyspace/shard.
 	_, _, err = rpcVTGate.Execute(
@@ -166,10 +170,8 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 		"select id from none",
 		nil,
 	)
-	want = "TestUnsharded.noshard.master: no valid tablet"
-	if err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("Execute: %v, want %s", err, want)
-	}
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `no healthy tablet available for 'keyspace:"TestUnsharded" shard:"noshard" tablet_type:MASTER`)
 }
 
 func TestVTGateStreamExecute(t *testing.T) {
@@ -200,9 +202,7 @@ func TestVTGateStreamExecute(t *testing.T) {
 	}, {
 		Rows: sandboxconn.StreamRowResult.Rows,
 	}}
-	if !reflect.DeepEqual(want, qrs) {
-		t.Errorf("want \n%+v, got \n%+v", want, qrs)
-	}
+	utils.MustMatch(t, want, qrs)
 	if !proto.Equal(sbc.Options[0], executeOptions) {
 		t.Errorf("got ExecuteOptions \n%+v, want \n%+v", sbc.Options[0], executeOptions)
 	}

@@ -68,7 +68,7 @@ func TestBuildPermissions(t *testing.T) {
 		input:  "show variable like 'a%'",
 		output: nil,
 	}, {
-		input:  "describe t",
+		input:  "describe select * from t",
 		output: nil,
 	}, {
 		input: "create table t",
@@ -78,6 +78,15 @@ func TestBuildPermissions(t *testing.T) {
 		}},
 	}, {
 		input: "rename table t1 to t2",
+		output: []Permission{{
+			TableName: "t1",
+			Role:      tableacl.ADMIN,
+		}, {
+			TableName: "t2",
+			Role:      tableacl.ADMIN,
+		}},
+	}, {
+		input: "flush tables t1, t2",
 		output: []Permission{{
 			TableName: "t1",
 			Role:      tableacl.ADMIN,

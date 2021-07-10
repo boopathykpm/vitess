@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"sort"
-	"strings"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/sqltypes"
@@ -160,7 +162,7 @@ type AutoIncrement struct {
 }
 
 // BuildVSchema builds a VSchema from a SrvVSchema.
-func BuildVSchema(source *vschemapb.SrvVSchema) (vschema *VSchema, err error) {
+func BuildVSchema(source *vschemapb.SrvVSchema) (vschema *VSchema) {
 	vschema = &VSchema{
 		RoutingRules:   make(map[string]*RoutingRule),
 		uniqueTables:   make(map[string]*Table),
@@ -171,7 +173,7 @@ func BuildVSchema(source *vschemapb.SrvVSchema) (vschema *VSchema, err error) {
 	resolveAutoIncrement(source, vschema)
 	addDual(vschema)
 	buildRoutingRule(source, vschema)
-	return vschema, nil
+	return vschema
 }
 
 // BuildKeyspaceSchema builds the vschema portion for one keyspace.
@@ -352,7 +354,11 @@ func resolveAutoIncrement(source *vschemapb.SrvVSchema, vschema *VSchema) {
 			if t == nil || table.AutoIncrement == nil {
 				continue
 			}
-			seq, err := vschema.findQualified(table.AutoIncrement.Sequence)
+			seqks, seqtab, err := sqlparser.ParseTable(table.AutoIncrement.Sequence)
+			var seq *Table
+			if err == nil {
+				seq, err = vschema.FindTable(seqks, seqtab)
+			}
 			if err != nil {
 				// Better to remove the table than to leave it partially initialized.
 				delete(ksvschema.Tables, tname)
@@ -397,6 +403,12 @@ func buildRoutingRule(source *vschemapb.SrvVSchema, vschema *VSchema) {
 outer:
 	for _, rule := range source.RoutingRules.Rules {
 		rr := &RoutingRule{}
+		if len(rule.ToTables) > 1 {
+			vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+				Error: fmt.Errorf("table %v has more than one target: %v", rule.FromTable, rule.ToTables),
+			}
+			continue
+		}
 		for _, toTable := range rule.ToTables {
 			if _, ok := vschema.RoutingRules[rule.FromTable]; ok {
 				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
@@ -404,27 +416,25 @@ outer:
 				}
 				continue outer
 			}
-			parts := strings.Split(toTable, ".")
-			if len(parts) != 2 {
-				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
-					Error: fmt.Errorf("table %s must be qualified", toTable),
-				}
-				continue outer
-			}
-			t, err := vschema.FindTable(parts[0], parts[1])
+			toks, totabname, err := sqlparser.ParseTable(toTable)
 			if err != nil {
 				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
 					Error: err,
 				}
 				continue outer
 			}
-			for _, existing := range rr.Tables {
-				if existing == t {
-					vschema.RoutingRules[rule.FromTable] = &RoutingRule{
-						Error: fmt.Errorf("table %s specified more than once", toTable),
-					}
-					continue outer
+			if toks == "" {
+				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+					Error: fmt.Errorf("table %s must be qualified", toTable),
 				}
+				continue outer
+			}
+			t, err := vschema.FindTable(toks, totabname)
+			if err != nil {
+				vschema.RoutingRules[rule.FromTable] = &RoutingRule{
+					Error: err,
+				}
+				continue outer
 			}
 			rr.Tables = append(rr.Tables, t)
 		}
@@ -432,22 +442,10 @@ outer:
 	}
 }
 
-// findQualified finds a table t or k.t.
-func (vschema *VSchema) findQualified(name string) (*Table, error) {
-	splits := strings.Split(name, ".")
-	switch len(splits) {
-	case 1:
-		return vschema.FindTable("", splits[0])
-	case 2:
-		return vschema.FindTable(splits[0], splits[1])
-	}
-	return nil, fmt.Errorf("table %s not found", name)
-}
-
 // FindTable returns a pointer to the Table. If a keyspace is specified, only tables
 // from that keyspace are searched. If the specified keyspace is unsharded
 // and no tables matched, it's considered valid: FindTable will construct a table
-// of that name and return it. If no kesypace is specified, then a table is returned
+// of that name and return it. If no keyspace is specified, then a table is returned
 // only if its name is unique across all keyspaces. If there is only one
 // keyspace in the vschema, and it's unsharded, then all table requests are considered
 // valid and belonging to that keyspace.
@@ -486,7 +484,7 @@ func (vschema *VSchema) findTable(keyspace, tablename string) (*Table, error) {
 	}
 	ks, ok := vschema.Keyspaces[keyspace]
 	if !ok {
-		return nil, fmt.Errorf("keyspace %s not found in vschema", keyspace)
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", keyspace)
 	}
 	table := ks.Tables[tablename]
 	if table == nil {
@@ -498,7 +496,8 @@ func (vschema *VSchema) findTable(keyspace, tablename string) (*Table, error) {
 	return table, nil
 }
 
-func (vschema *VSchema) findTables(keyspace, tablename string, tabletType topodatapb.TabletType) ([]*Table, error) {
+// FindRoutedTable finds a table checking the routing rules.
+func (vschema *VSchema) FindRoutedTable(keyspace, tablename string, tabletType topodatapb.TabletType) (*Table, error) {
 	qualified := tablename
 	if keyspace != "" {
 		qualified = keyspace + "." + tablename
@@ -515,22 +514,15 @@ func (vschema *VSchema) findTables(keyspace, tablename string, tabletType topoda
 			if len(rr.Tables) == 0 {
 				return nil, fmt.Errorf("table %s has been disabled", tablename)
 			}
-			return rr.Tables, nil
+			return rr.Tables[0], nil
 		}
 	}
-	t, err := vschema.findTable(keyspace, tablename)
-	if err != nil {
-		return nil, err
-	}
-	if t == nil {
-		return nil, nil
-	}
-	return []*Table{t}, nil
+	return vschema.findTable(keyspace, tablename)
 }
 
-// FindTablesOrVindex finds a table or a Vindex by name using Find and FindVindex.
-func (vschema *VSchema) FindTablesOrVindex(keyspace, name string, tabletType topodatapb.TabletType) ([]*Table, Vindex, error) {
-	tables, err := vschema.findTables(keyspace, name, tabletType)
+// FindTableOrVindex finds a table or a Vindex by name using Find and FindVindex.
+func (vschema *VSchema) FindTableOrVindex(keyspace, name string, tabletType topodatapb.TabletType) (*Table, Vindex, error) {
+	tables, err := vschema.FindRoutedTable(keyspace, name, tabletType)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -544,7 +536,16 @@ func (vschema *VSchema) FindTablesOrVindex(keyspace, name string, tabletType top
 	if v != nil {
 		return nil, v, nil
 	}
-	return nil, nil, fmt.Errorf("table %s not found", name)
+	return nil, nil, NotFoundError{TableName: name}
+}
+
+// NotFoundError represents the error where the table name was not found
+type NotFoundError struct {
+	TableName string
+}
+
+func (n NotFoundError) Error() string {
+	return fmt.Sprintf("table %s not found", n.TableName)
 }
 
 // FindVindex finds a vindex by name. If a keyspace is specified, only vindexes
@@ -561,7 +562,7 @@ func (vschema *VSchema) FindVindex(keyspace, name string) (Vindex, error) {
 	}
 	ks, ok := vschema.Keyspaces[keyspace]
 	if !ok {
-		return nil, fmt.Errorf("keyspace %s not found in vschema", keyspace)
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", keyspace)
 	}
 	return ks.Vindexes[name], nil
 }

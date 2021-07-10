@@ -19,7 +19,7 @@ package srvtopo
 import (
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/log"
@@ -33,7 +33,7 @@ import (
 // for the provided tablet types. It returns one Target object per
 // keyspace / shard / matching TabletType.
 func FindAllTargets(ctx context.Context, ts Server, cell string, tabletTypes []topodatapb.TabletType) ([]*querypb.Target, error) {
-	ksNames, err := ts.GetSrvKeyspaceNames(ctx, cell)
+	ksNames, err := ts.GetSrvKeyspaceNames(ctx, cell, true)
 	if err != nil {
 		return nil, err
 	}

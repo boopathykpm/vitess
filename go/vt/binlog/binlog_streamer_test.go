@@ -23,8 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 
@@ -39,7 +40,7 @@ type fullBinlogTransaction struct {
 	statements []FullBinlogStatement
 }
 
-type binlogStatements []binlogdatapb.BinlogTransaction
+type binlogStatements []*binlogdatapb.BinlogTransaction
 
 func (bs *binlogStatements) sendTransaction(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 	var s []*binlogdatapb.BinlogTransaction_Statement
@@ -49,19 +50,19 @@ func (bs *binlogStatements) sendTransaction(eventToken *querypb.EventToken, stat
 			s[i] = statement.Statement
 		}
 	}
-	*bs = append(*bs, binlogdatapb.BinlogTransaction{
+	*bs = append(*bs, &binlogdatapb.BinlogTransaction{
 		Statements: s,
 		EventToken: eventToken,
 	})
 	return nil
 }
 
-func (bs *binlogStatements) equal(bts []binlogdatapb.BinlogTransaction) bool {
+func (bs *binlogStatements) equal(bts []*binlogdatapb.BinlogTransaction) bool {
 	if len(*bs) != len(bts) {
 		return false
 	}
 	for i, s := range *bs {
-		if !proto.Equal(&s, &bts[i]) {
+		if !proto.Equal(s, bts[i]) {
 			return false
 		}
 	}
@@ -95,7 +96,7 @@ func TestStreamerParseEventsXID(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -105,7 +106,7 @@ func TestStreamerParseEventsXID(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -158,7 +159,7 @@ func TestStreamerParseEventsCommit(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -168,7 +169,7 @@ func TestStreamerParseEventsCommit(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -577,14 +578,14 @@ func TestStreamerParseEventsRollback(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: nil,
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -602,7 +603,7 @@ func TestStreamerParseEventsRollback(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -648,7 +649,7 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -658,7 +659,7 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -673,7 +674,7 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -723,7 +724,7 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -733,7 +734,7 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -748,7 +749,7 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -799,7 +800,7 @@ func TestStreamerParseEventsSetInsertID(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET INSERT_ID=101")},
@@ -810,7 +811,7 @@ func TestStreamerParseEventsSetInsertID(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -904,7 +905,7 @@ func TestStreamerParseEventsOtherDB(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -914,7 +915,7 @@ func TestStreamerParseEventsOtherDB(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -966,7 +967,7 @@ func TestStreamerParseEventsOtherDBBegin(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -976,7 +977,7 @@ func TestStreamerParseEventsOtherDBBegin(t *testing.T) {
 				Timestamp: 1407805592,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -1068,7 +1069,7 @@ func TestStreamerParseEventsMariadbBeginGTID(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{
@@ -1086,7 +1087,7 @@ func TestStreamerParseEventsMariadbBeginGTID(t *testing.T) {
 				Timestamp: 1409892744,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 10,
@@ -1135,7 +1136,7 @@ func TestStreamerParseEventsMariadbStandaloneGTID(t *testing.T) {
 
 	events := make(chan mysql.BinlogEvent)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Charset: &binlogdatapb.Charset{Client: 8, Conn: 8, Server: 33}, Sql: []byte("SET TIMESTAMP=1409892744")},
@@ -1145,7 +1146,7 @@ func TestStreamerParseEventsMariadbStandaloneGTID(t *testing.T) {
 				Timestamp: 1409892744,
 				Position: mysql.EncodePosition(mysql.Position{
 					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+						0: mysql.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 9,

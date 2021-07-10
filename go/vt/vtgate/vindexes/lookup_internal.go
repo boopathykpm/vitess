@@ -36,6 +36,7 @@ type lookupInternal struct {
 	To            string   `json:"to"`
 	Autocommit    bool     `json:"autocommit,omitempty"`
 	Upsert        bool     `json:"upsert,omitempty"`
+	IgnoreNulls   bool     `json:"ignore_nulls,omitempty"`
 	sel, ver, del string
 }
 
@@ -48,39 +49,83 @@ func (lkp *lookupInternal) Init(lookupQueryParams map[string]string, autocommit,
 	}
 	lkp.FromColumns = fromColumns
 
+	var err error
+	lkp.IgnoreNulls, err = boolFromMap(lookupQueryParams, "ignore_nulls")
+	if err != nil {
+		return err
+	}
+
 	lkp.Autocommit = autocommit
 	lkp.Upsert = upsert
 
 	// TODO @rafael: update sel and ver to support multi column vindexes. This will be done
 	// as part of face 2 of https://github.com/vitessio/vitess/issues/3481
 	// For now multi column behaves as a single column for Map and Verify operations
-	lkp.sel = fmt.Sprintf("select %s from %s where %s = :%s", lkp.To, lkp.Table, lkp.FromColumns[0], lkp.FromColumns[0])
+	lkp.sel = fmt.Sprintf("select %s, %s from %s where %s in ::%s", lkp.FromColumns[0], lkp.To, lkp.Table, lkp.FromColumns[0], lkp.FromColumns[0])
 	lkp.ver = fmt.Sprintf("select %s from %s where %s = :%s and %s = :%s", lkp.FromColumns[0], lkp.Table, lkp.FromColumns[0], lkp.FromColumns[0], lkp.To, lkp.To)
 	lkp.del = lkp.initDelStmt()
 	return nil
 }
 
 // Lookup performs a lookup for the ids.
-func (lkp *lookupInternal) Lookup(vcursor VCursor, ids []sqltypes.Value) ([]*sqltypes.Result, error) {
+func (lkp *lookupInternal) Lookup(vcursor VCursor, ids []sqltypes.Value, co vtgatepb.CommitOrder) ([]*sqltypes.Result, error) {
 	if vcursor == nil {
 		return nil, fmt.Errorf("cannot perform lookup: no vcursor provided")
 	}
 	results := make([]*sqltypes.Result, 0, len(ids))
-	for _, id := range ids {
-		bindVars := map[string]*querypb.BindVariable{
-			lkp.FromColumns[0]: sqltypes.ValueBindVariable(id),
-		}
-		var err error
-		var result *sqltypes.Result
-		co := vtgatepb.CommitOrder_NORMAL
-		if lkp.Autocommit {
-			co = vtgatepb.CommitOrder_AUTOCOMMIT
-		}
-		result, err = vcursor.Execute("VindexLookup", lkp.sel, bindVars, false /* rollbackOnError */, co)
+	if lkp.Autocommit {
+		co = vtgatepb.CommitOrder_AUTOCOMMIT
+	}
+	sel := lkp.sel
+	if vcursor.InTransactionAndIsDML() {
+		sel = sel + " for update"
+	}
+	if ids[0].IsIntegral() {
+		// for integral types, batch query all ids and then map them back to the input order
+		vars, err := sqltypes.BuildBindVariable(ids)
 		if err != nil {
 			return nil, fmt.Errorf("lookup.Map: %v", err)
 		}
-		results = append(results, result)
+		bindVars := map[string]*querypb.BindVariable{
+			lkp.FromColumns[0]: vars,
+		}
+		result, err := vcursor.Execute("VindexLookup", sel, bindVars, false /* rollbackOnError */, co)
+		if err != nil {
+			return nil, fmt.Errorf("lookup.Map: %v", err)
+		}
+		resultMap := make(map[string][][]sqltypes.Value)
+		for _, row := range result.Rows {
+			resultMap[row[0].ToString()] = append(resultMap[row[0].ToString()], []sqltypes.Value{row[1]})
+		}
+
+		for _, id := range ids {
+			results = append(results, &sqltypes.Result{
+				Rows: resultMap[id.ToString()],
+			})
+		}
+	} else {
+		// for non integral and binary type, fallback to send query per id
+		for _, id := range ids {
+			vars, err := sqltypes.BuildBindVariable([]interface{}{id})
+			if err != nil {
+				return nil, fmt.Errorf("lookup.Map: %v", err)
+			}
+			bindVars := map[string]*querypb.BindVariable{
+				lkp.FromColumns[0]: vars,
+			}
+			var result *sqltypes.Result
+			result, err = vcursor.Execute("VindexLookup", sel, bindVars, false /* rollbackOnError */, co)
+			if err != nil {
+				return nil, fmt.Errorf("lookup.Map: %v", err)
+			}
+			rows := make([][]sqltypes.Value, 0, len(result.Rows))
+			for _, row := range result.Rows {
+				rows = append(rows, []sqltypes.Value{row[1]})
+			}
+			results = append(results, &sqltypes.Result{
+				Rows: rows,
+			})
+		}
 	}
 	return results, nil
 }
@@ -158,15 +203,32 @@ func (lkp *lookupInternal) Create(vcursor VCursor, rowsColValues [][]sqltypes.Va
 }
 
 func (lkp *lookupInternal) createCustom(vcursor VCursor, rowsColValues [][]sqltypes.Value, toValues []sqltypes.Value, ignoreMode bool, co vtgatepb.CommitOrder) error {
-	if len(rowsColValues) == 0 {
-		// This code is unreachable. It's just a failsafe.
+	// Trim rows with null values
+	trimmedRowsCols := make([][]sqltypes.Value, 0, len(rowsColValues))
+	trimmedToValues := make([]sqltypes.Value, 0, len(toValues))
+nextRow:
+	for i, row := range rowsColValues {
+		for j, col := range row {
+			if col.IsNull() {
+				if !lkp.IgnoreNulls {
+					return fmt.Errorf("lookup.Create: input has null values: row: %d, col: %d", i, j)
+				}
+				continue nextRow
+			}
+		}
+		trimmedRowsCols = append(trimmedRowsCols, row)
+		trimmedToValues = append(trimmedToValues, toValues[i])
+	}
+	if len(trimmedRowsCols) == 0 {
 		return nil
 	}
 	// We only need to check the first row. Number of cols per row
 	// is guaranteed by the engine to be uniform.
-	if len(rowsColValues[0]) != len(lkp.FromColumns) {
-		return fmt.Errorf("lookup.Create: column vindex count does not match the columns in the lookup: %d vs %v", len(rowsColValues[0]), lkp.FromColumns)
+	if len(trimmedRowsCols[0]) != len(lkp.FromColumns) {
+		return fmt.Errorf("lookup.Create: column vindex count does not match the columns in the lookup: %d vs %v", len(trimmedRowsCols[0]), lkp.FromColumns)
 	}
+	sort.Sort(&sorter{rowsColValues: trimmedRowsCols, toValues: trimmedToValues})
+
 	buf := new(bytes.Buffer)
 	if ignoreMode {
 		fmt.Fprintf(buf, "insert ignore into %s(", lkp.Table)
@@ -178,24 +240,20 @@ func (lkp *lookupInternal) createCustom(vcursor VCursor, rowsColValues [][]sqlty
 	}
 	fmt.Fprintf(buf, "%s) values(", lkp.To)
 
-	bindVars := make(map[string]*querypb.BindVariable, 2*len(rowsColValues))
-	// Make a copy before sorting.
-	rowsColValues = append([][]sqltypes.Value(nil), rowsColValues...)
-	toValues = append([]sqltypes.Value(nil), toValues...)
-	sort.Sort(&sorter{rowsColValues: rowsColValues, toValues: toValues})
-	for rowIdx := range toValues {
-		colIds := rowsColValues[rowIdx]
+	bindVars := make(map[string]*querypb.BindVariable, 2*len(trimmedRowsCols))
+	for rowIdx := range trimmedToValues {
+		colIds := trimmedRowsCols[rowIdx]
 		if rowIdx != 0 {
 			buf.WriteString(", (")
 		}
 		for colIdx, colID := range colIds {
-			fromStr := lkp.FromColumns[colIdx] + strconv.Itoa(rowIdx)
+			fromStr := lkp.FromColumns[colIdx] + "_" + strconv.Itoa(rowIdx)
 			bindVars[fromStr] = sqltypes.ValueBindVariable(colID)
 			buf.WriteString(":" + fromStr + ", ")
 		}
-		toStr := lkp.To + strconv.Itoa(rowIdx)
+		toStr := lkp.To + "_" + strconv.Itoa(rowIdx)
 		buf.WriteString(":" + toStr + ")")
-		bindVars[toStr] = sqltypes.ValueBindVariable(toValues[rowIdx])
+		bindVars[toStr] = sqltypes.ValueBindVariable(trimmedToValues[rowIdx])
 	}
 
 	if lkp.Upsert {

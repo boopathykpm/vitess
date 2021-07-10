@@ -1,11 +1,29 @@
 # vindex func read all cols
-"select id, keyspace_id, range_start, range_end from user_index where id = :id"
+"select id, keyspace_id, range_start, range_end, hex_keyspace_id, shard from user_index where id = :id"
 {
   "QueryType": "SELECT",
-  "Original": "select id, keyspace_id, range_start, range_end from user_index where id = :id",
+  "Original": "select id, keyspace_id, range_start, range_end, hex_keyspace_id, shard from user_index where id = :id",
   "Instructions": {
-    "OperatorType": "vindexfunc - not implemented",
-    "Variant": ""
+    "OperatorType": "VindexFunc",
+    "Variant": "VindexMap",
+    "Columns": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "Fields": {
+      "hex_keyspace_id": "VARBINARY",
+      "id": "VARBINARY",
+      "keyspace_id": "VARBINARY",
+      "range_end": "VARBINARY",
+      "range_start": "VARBINARY",
+      "shard": "VARBINARY"
+    },
+    "Value": ":id",
+    "Vindex": "user_index"
   }
 }
 
@@ -15,8 +33,26 @@
   "QueryType": "SELECT",
   "Original": "select * from user_index where id = :id",
   "Instructions": {
-    "OperatorType": "vindexfunc - not implemented",
-    "Variant": ""
+    "OperatorType": "VindexFunc",
+    "Variant": "VindexMap",
+    "Columns": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "Fields": {
+      "hex_keyspace_id": "VARBINARY",
+      "id": "VARBINARY",
+      "keyspace_id": "VARBINARY",
+      "range_end": "VARBINARY",
+      "range_start": "VARBINARY",
+      "shard": "VARBINARY"
+    },
+    "Value": ":id",
+    "Vindex": "user_index"
   }
 }
 
@@ -26,14 +62,26 @@
   "QueryType": "SELECT",
   "Original": "select id, keyspace_id, id from user_index where id = :id",
   "Instructions": {
-    "OperatorType": "vindexfunc - not implemented",
-    "Variant": ""
+    "OperatorType": "VindexFunc",
+    "Variant": "VindexMap",
+    "Columns": [
+      0,
+      1,
+      0
+    ],
+    "Fields": {
+      "id": "VARBINARY",
+      "keyspace_id": "VARBINARY"
+    },
+    "Value": ":id",
+    "Vindex": "user_index"
   }
 }
 
 # ambiguous vindex reference
 "select id, keyspace_id, id from hash_dup where id = :id"
 "ambiguous vindex reference: hash_dup"
+Gen4 plan same as above
 
 # disambiguated vindex reference
 "select id, keyspace_id, id from second_user.hash_dup where id = :id"
@@ -41,8 +89,19 @@
   "QueryType": "SELECT",
   "Original": "select id, keyspace_id, id from second_user.hash_dup where id = :id",
   "Instructions": {
-    "OperatorType": "vindexfunc - not implemented",
-    "Variant": ""
+    "OperatorType": "VindexFunc",
+    "Variant": "VindexMap",
+    "Columns": [
+      0,
+      1,
+      0
+    ],
+    "Fields": {
+      "id": "VARBINARY",
+      "keyspace_id": "VARBINARY"
+    },
+    "Value": ":id",
+    "Vindex": "hash_dup"
   }
 }
 
@@ -58,8 +117,16 @@
     "TableName": "_unsharded",
     "Inputs": [
       {
-        "OperatorType": "vindexfunc - not implemented",
-        "Variant": ""
+        "OperatorType": "VindexFunc",
+        "Variant": "VindexMap",
+        "Columns": [
+          1
+        ],
+        "Fields": {
+          "keyspace_id": "VARBINARY"
+        },
+        "Value": ":id",
+        "Vindex": "user_index"
       },
       {
         "OperatorType": "Route",
@@ -99,8 +166,16 @@
         "Table": "unsharded"
       },
       {
-        "OperatorType": "vindexfunc - not implemented",
-        "Variant": ""
+        "OperatorType": "VindexFunc",
+        "Variant": "VindexMap",
+        "Columns": [
+          1
+        ],
+        "Fields": {
+          "keyspace_id": "VARBINARY"
+        },
+        "Value": ":id",
+        "Vindex": "user_index"
       }
     ]
   }
@@ -118,8 +193,18 @@
     "TableName": "_unsharded",
     "Inputs": [
       {
-        "OperatorType": "vindexfunc - not implemented",
-        "Variant": ""
+        "OperatorType": "VindexFunc",
+        "Variant": "VindexMap",
+        "Columns": [
+          0,
+          1
+        ],
+        "Fields": {
+          "id": "VARBINARY",
+          "keyspace_id": "VARBINARY"
+        },
+        "Value": ":id",
+        "Vindex": "user_index"
       },
       {
         "OperatorType": "Route",
@@ -148,8 +233,18 @@
     "TableName": "_unsharded",
     "Inputs": [
       {
-        "OperatorType": "vindexfunc - not implemented",
-        "Variant": ""
+        "OperatorType": "VindexFunc",
+        "Variant": "VindexMap",
+        "Columns": [
+          1,
+          0
+        ],
+        "Fields": {
+          "id": "VARBINARY",
+          "keyspace_id": "VARBINARY"
+        },
+        "Value": ":id",
+        "Vindex": "user_index"
       },
       {
         "OperatorType": "Route",
@@ -178,8 +273,18 @@
     "TableName": "_unsharded",
     "Inputs": [
       {
-        "OperatorType": "vindexfunc - not implemented",
-        "Variant": ""
+        "OperatorType": "VindexFunc",
+        "Variant": "VindexMap",
+        "Columns": [
+          1,
+          0
+        ],
+        "Fields": {
+          "id": "VARBINARY",
+          "keyspace_id": "VARBINARY"
+        },
+        "Value": ":id",
+        "Vindex": "user_index"
       },
       {
         "OperatorType": "Route",
@@ -197,25 +302,4 @@
 }
 
 "select none from user_index where id = :id"
-"symbol none not found in table or subquery"
-
-"select * from samecolvin where col = :col"
-{
-  "QueryType": "SELECT",
-  "Original": "select * from samecolvin where col = :col",
-  "Instructions": {
-    "OperatorType": "Route",
-    "Variant": "SelectEqualUnique",
-    "Keyspace": {
-      "Name": "user",
-      "Sharded": true
-    },
-    "FieldQuery": "select col from samecolvin where 1 != 1",
-    "Query": "select col from samecolvin where col = :col",
-    "Table": "samecolvin",
-    "Values": [
-      ":col"
-    ],
-    "Vindex": "vindex1"
-  }
-}
+"symbol `none` not found in table or subquery"

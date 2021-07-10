@@ -24,8 +24,10 @@ import (
 	"io"
 	"strings"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"google.golang.org/grpc"
+
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -131,6 +133,7 @@ var currentTracer tracingService = noopTracingServer{}
 
 var (
 	tracingServer = flag.String("tracer", "noop", "tracing service to use")
+	enableLogging = flag.Bool("tracing-enable-logging", false, "whether to enable logging in the tracing service")
 )
 
 // StartTracing enables tracing for a named service
@@ -147,8 +150,9 @@ func StartTracing(serviceName string) io.Closer {
 	}
 
 	currentTracer = tracer
-
-	log.Infof("successfully started tracing with [%s]", *tracingServer)
+	if *tracingServer != "noop" {
+		log.Infof("successfully started tracing with [%s]", *tracingServer)
+	}
 
 	return closer
 }

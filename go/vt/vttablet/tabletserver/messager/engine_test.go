@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
@@ -170,9 +170,9 @@ func TestEngineGenerate(t *testing.T) {
 }
 
 func newTestEngine(db *fakesqldb.DB) *Engine {
-	config := tabletenv.DefaultQsConfig
+	config := tabletenv.NewDefaultConfig()
 	tsv := &fakeTabletServer{
-		Env: tabletenv.NewTestEnv(&config, nil, "MessagerTest"),
+		Env: tabletenv.NewEnv(config, "MessagerTest"),
 	}
 	se := schema.NewEngine(tsv)
 	te := NewEngine(tsv, se, newFakeVStreamer())

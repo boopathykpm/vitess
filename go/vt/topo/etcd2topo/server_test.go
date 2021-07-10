@@ -17,6 +17,7 @@ limitations under the License.
 package etcd2topo
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -25,18 +26,14 @@ import (
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/tlstest"
-
-	"github.com/coreos/etcd/pkg/transport"
-
-	"golang.org/x/net/context"
-
-	"github.com/coreos/etcd/clientv3"
 	"vitess.io/vitess/go/testfiles"
+	"vitess.io/vitess/go/vt/log"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/tlstest"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/test"
 
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // startEtcd starts an etcd subprocess, and waits for it to be ready.
@@ -133,14 +130,10 @@ func startEtcdWithTLS(t *testing.T) (string, *tlstest.ClientServerKeyPairs, func
 		t.Fatalf("failed to start etcd: %v", err)
 	}
 
-	// Safe now to build up TLS info.
-	tlsInfo := transport.TLSInfo{
-		CertFile:      certs.ClientCert,
-		KeyFile:       certs.ClientKey,
-		TrustedCAFile: certs.ServerCA,
+	tlsConfig, err := newTLSConfig(certs.ClientCert, certs.ClientKey, certs.ServerCA)
+	if err != nil {
+		t.Fatalf("failed to get tls.Config: %v", err)
 	}
-
-	tlsConfig, err := tlsInfo.ClientConfig()
 
 	var cli *clientv3.Client
 	// Create client
@@ -178,8 +171,14 @@ func startEtcdWithTLS(t *testing.T) (string, *tlstest.ClientServerKeyPairs, func
 	}
 
 	stopEtcd := func() {
-		cmd.Process.Kill()
-		cmd.Wait()
+		// log error
+		if err := cmd.Process.Kill(); err != nil {
+			log.Errorf("cmd.Process.Kill() failed : %v", err)
+		}
+		// log error
+		if err := cmd.Wait(); err != nil {
+			log.Errorf("cmd.wait() failed : %v", err)
+		}
 		os.RemoveAll(dataDir)
 	}
 

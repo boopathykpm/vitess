@@ -34,6 +34,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/test/endtoend/cluster"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -508,7 +509,7 @@ func runShardTablets(t *testing.T, shardName string, tabletArr []*cluster.Vttabl
 	// set a replica or rdonly tablet back to NOT_SERVING.
 
 	for _, tablet := range tabletArr {
-		err = tablet.VttabletProcess.WaitForTabletType("SERVING")
+		err = tablet.VttabletProcess.WaitForTabletStatus("SERVING")
 		require.Nil(t, err)
 	}
 
@@ -560,15 +561,15 @@ func initializeCluster(t *testing.T, onlyTopo bool) (int, error) {
 	}
 
 	// Defining all the tablets
-	master = localCluster.GetVttabletInstance("replica", 0, "")
-	replica1 = localCluster.GetVttabletInstance("replica", 0, "")
-	rdOnly1 = localCluster.GetVttabletInstance("rdonly", 0, "")
-	shard0Master = localCluster.GetVttabletInstance("replica", 0, "")
-	shard0Replica = localCluster.GetVttabletInstance("replica", 0, "")
-	shard0RdOnly1 = localCluster.GetVttabletInstance("rdonly", 0, "")
-	shard1Master = localCluster.GetVttabletInstance("replica", 0, "")
-	shard1Replica = localCluster.GetVttabletInstance("replica", 0, "")
-	shard1RdOnly1 = localCluster.GetVttabletInstance("rdonly", 0, "")
+	master = localCluster.NewVttabletInstance("replica", 0, "")
+	replica1 = localCluster.NewVttabletInstance("replica", 0, "")
+	rdOnly1 = localCluster.NewVttabletInstance("rdonly", 0, "")
+	shard0Master = localCluster.NewVttabletInstance("replica", 0, "")
+	shard0Replica = localCluster.NewVttabletInstance("replica", 0, "")
+	shard0RdOnly1 = localCluster.NewVttabletInstance("rdonly", 0, "")
+	shard1Master = localCluster.NewVttabletInstance("replica", 0, "")
+	shard1Replica = localCluster.NewVttabletInstance("replica", 0, "")
+	shard1RdOnly1 = localCluster.NewVttabletInstance("rdonly", 0, "")
 
 	shard.Vttablets = []*cluster.Vttablet{master, replica1, rdOnly1}
 	shard0.Vttablets = []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly1}
@@ -576,7 +577,7 @@ func initializeCluster(t *testing.T, onlyTopo bool) (int, error) {
 
 	localCluster.VtTabletExtraArgs = append(localCluster.VtTabletExtraArgs, commonTabletArg...)
 
-	err = localCluster.LaunchCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
+	err = localCluster.SetupCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
 	assert.Nil(t, err)
 
 	// Start MySql

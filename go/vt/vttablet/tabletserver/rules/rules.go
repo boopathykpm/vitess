@@ -24,6 +24,8 @@ import (
 	"regexp"
 	"strconv"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
@@ -68,6 +70,16 @@ func (qrs *Rules) Copy() (newqrs *Rules) {
 		}
 	}
 	return newqrs
+}
+
+// CopyUnderlying makes a copy of the underlying rule array and returns it to
+// the caller.
+func (qrs *Rules) CopyUnderlying() []*Rule {
+	cpy := make([]*Rule, 0, len(qrs.rules))
+	for _, r := range qrs.rules {
+		cpy = append(cpy, r.Copy())
+	}
+	return cpy
 }
 
 // Append merges the rules from another Rules into the receiver
@@ -732,7 +744,7 @@ func getuint64(val *querypb.BindVariable) (uv uint64, status int) {
 	if err != nil {
 		return 0, QROutOfRange
 	}
-	v, err := sqltypes.ToUint64(bv)
+	v, err := evalengine.ToUint64(bv)
 	if err != nil {
 		return 0, QROutOfRange
 	}
@@ -745,7 +757,7 @@ func getint64(val *querypb.BindVariable) (iv int64, status int) {
 	if err != nil {
 		return 0, QROutOfRange
 	}
-	v, err := sqltypes.ToInt64(bv)
+	v, err := evalengine.ToInt64(bv)
 	if err != nil {
 		return 0, QROutOfRange
 	}

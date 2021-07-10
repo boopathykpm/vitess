@@ -19,10 +19,12 @@ package worker
 import (
 	"fmt"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
@@ -105,8 +107,8 @@ func generateChunks(ctx context.Context, wr *wrangler.Wrangler, tablet *topodata
 	}
 
 	result := sqltypes.Proto3ToResult(qr)
-	min, _ := sqltypes.ToNative(result.Rows[0][0])
-	max, _ := sqltypes.ToNative(result.Rows[0][1])
+	min, _ := evalengine.ToNative(result.Rows[0][0])
+	max, _ := evalengine.ToNative(result.Rows[0][1])
 
 	if min == nil || max == nil {
 		wr.Logger().Infof("table=%v: Not splitting the table into multiple chunks, min or max is NULL: %v", td.Name, qr.Rows[0])

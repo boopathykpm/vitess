@@ -18,6 +18,7 @@ package vtctld
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"vitess.io/vitess/go/vt/discovery"
@@ -342,7 +343,7 @@ func TestTabletStats(t *testing.T) {
 	tabletStatsCache.StatsUpdate(ts1)
 	tabletStatsCache.StatsUpdate(ts2)
 
-	// Test 1: tablet1 and tablet2 are updated with the stats received by the HealthCheck module.
+	// Test 1: tablet1 and tablet2 are updated with the stats received by the LegacyHealthCheck module.
 	got1, err := tabletStatsCache.tabletStats(ts1.Tablet.Alias)
 	want1 := ts1
 	if err != nil || !got1.DeepEqual(want1) {
@@ -357,9 +358,8 @@ func TestTabletStats(t *testing.T) {
 
 	// Test 2: tablet3 isn't found in the map since no update was received for it.
 	_, gotErr := tabletStatsCache.tabletStats(ts3.Tablet.Alias)
-	wantErr := "could not find tablet: cell:\"cell1\" uid:300 "
-	if gotErr.Error() != wantErr {
-		t.Errorf("got: %v, want: %v", gotErr.Error(), wantErr)
+	if !strings.Contains(gotErr.Error(), "could not find tablet") {
+		t.Errorf("bad error message: %v", gotErr.Error())
 	}
 }
 
@@ -426,8 +426,8 @@ func TestTopologyInfo(t *testing.T) {
 	}
 }
 
-// tabletStats will create a discovery.TabletStats object.
-func tabletStats(keyspace, cell, shard string, tabletType topodatapb.TabletType, uid uint32) *discovery.TabletStats {
+// tabletStats will create a discovery.LegacyTabletStats object.
+func tabletStats(keyspace, cell, shard string, tabletType topodatapb.TabletType, uid uint32) *discovery.LegacyTabletStats {
 	target := &querypb.Target{
 		Keyspace:   keyspace,
 		Shard:      shard,
@@ -445,7 +445,7 @@ func tabletStats(keyspace, cell, shard string, tabletType topodatapb.TabletType,
 		// uid is used for SecondsBehindMaster to give it a unique value.
 		SecondsBehindMaster: uid,
 	}
-	stats := &discovery.TabletStats{
+	stats := &discovery.LegacyTabletStats{
 		Tablet:    tablet,
 		Target:    target,
 		Up:        true,

@@ -21,11 +21,16 @@ package topoproto
 import (
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -71,21 +76,36 @@ func TabletAliasUIDStr(ta *topodatapb.TabletAlias) string {
 	return fmt.Sprintf("%010d", ta.Uid)
 }
 
+const tabletAliasFormat = "^(?P<cell>[-_.a-zA-Z0-9]+)-(?P<uid>[0-9]+)$"
+
+var tabletAliasRegexp = regexp.MustCompile(tabletAliasFormat)
+
 // ParseTabletAlias returns a TabletAlias for the input string,
 // of the form <cell>-<uid>
 func ParseTabletAlias(aliasStr string) (*topodatapb.TabletAlias, error) {
-	nameParts := strings.Split(aliasStr, "-")
-	if len(nameParts) != 2 {
-		return nil, fmt.Errorf("invalid tablet alias: '%s', expecting format: '<cell>-<uid>'", aliasStr)
+	nameParts := tabletAliasRegexp.FindStringSubmatch(aliasStr)
+	if len(nameParts) != 3 {
+		return nil, fmt.Errorf("invalid tablet alias: '%s', expecting format: '%s'", aliasStr, tabletAliasFormat)
 	}
-	uid, err := ParseUID(nameParts[1])
+	uid, err := ParseUID(nameParts[tabletAliasRegexp.SubexpIndex("uid")])
 	if err != nil {
 		return nil, vterrors.Wrapf(err, "invalid tablet uid in alias '%s'", aliasStr)
 	}
 	return &topodatapb.TabletAlias{
-		Cell: nameParts[0],
+		Cell: nameParts[tabletAliasRegexp.SubexpIndex("cell")],
 		Uid:  uid,
 	}, nil
+}
+
+// ParseTabletSet returns a set of tablets based on a provided comma separated list of tablets.
+func ParseTabletSet(tabletListStr string) sets.String {
+	set := sets.NewString()
+	if tabletListStr == "" {
+		return set
+	}
+	list := strings.Split(tabletListStr, ",")
+	set.Insert(list...)
+	return set
 }
 
 // ParseUID parses just the uid (a number)
@@ -120,22 +140,21 @@ func (tal TabletAliasList) Swap(i, j int) {
 	tal[i], tal[j] = tal[j], tal[i]
 }
 
+// ToStringSlice returns a slice which is the result of mapping
+// TabletAliasString over a slice of TabletAliases.
+func (tal TabletAliasList) ToStringSlice() []string {
+	result := make([]string, len(tal))
+
+	for i, alias := range tal {
+		result[i] = TabletAliasString(alias)
+	}
+
+	return result
+}
+
 // AllTabletTypes lists all the possible tablet types
 var AllTabletTypes = []topodatapb.TabletType{
 	topodatapb.TabletType_MASTER,
-	topodatapb.TabletType_REPLICA,
-	topodatapb.TabletType_RDONLY,
-	topodatapb.TabletType_BATCH,
-	topodatapb.TabletType_SPARE,
-	topodatapb.TabletType_EXPERIMENTAL,
-	topodatapb.TabletType_BACKUP,
-	topodatapb.TabletType_RESTORE,
-	topodatapb.TabletType_DRAINED,
-}
-
-// SlaveTabletTypes contains all the tablet type that can have replication
-// enabled.
-var SlaveTabletTypes = []topodatapb.TabletType{
 	topodatapb.TabletType_REPLICA,
 	topodatapb.TabletType_RDONLY,
 	topodatapb.TabletType_BATCH,
@@ -179,7 +198,7 @@ func TabletTypeLString(tabletType topodatapb.TabletType) string {
 }
 
 // IsTypeInList returns true if the given type is in the list.
-// Use it with AllTabletType and SlaveTabletType for instance.
+// Use it with AllTabletTypes for instance.
 func IsTypeInList(tabletType topodatapb.TabletType, types []topodatapb.TabletType) bool {
 	for _, t := range types {
 		if tabletType == t {
@@ -199,50 +218,14 @@ func MakeStringTypeList(types []topodatapb.TabletType) []string {
 	return strs
 }
 
-// SetMysqlPort sets the mysql port for tablet. This function
-// also handles legacy by setting the port in PortMap.
-// TODO(sougou); deprecate this function after 3.0.
-func SetMysqlPort(tablet *topodatapb.Tablet, port int32) {
-	if tablet.MysqlHostname == "" || tablet.MysqlHostname == tablet.Hostname {
-		tablet.PortMap["mysql"] = port
-	}
-	// If it's the legacy form, preserve old behavior to prevent
-	// confusion between new and old code.
-	if tablet.MysqlHostname != "" {
-		tablet.MysqlPort = port
-	}
-}
-
 // MysqlAddr returns the host:port of the mysql server.
 func MysqlAddr(tablet *topodatapb.Tablet) string {
-	return fmt.Sprintf("%v:%v", MysqlHostname(tablet), MysqlPort(tablet))
-}
-
-// MysqlHostname returns the mysql host name. This function
-// also handles legacy behavior: it uses the tablet's hostname
-// if MysqlHostname is not specified.
-// TODO(sougou); deprecate this function after 3.0.
-func MysqlHostname(tablet *topodatapb.Tablet) string {
-	if tablet.MysqlHostname == "" {
-		return tablet.Hostname
-	}
-	return tablet.MysqlHostname
-}
-
-// MysqlPort returns the mysql port. This function
-// also handles legacy behavior: it uses the tablet's port map
-// if MysqlHostname is not specified.
-// TODO(sougou); deprecate this function after 3.0.
-func MysqlPort(tablet *topodatapb.Tablet) int32 {
-	if tablet.MysqlHostname == "" {
-		return tablet.PortMap["mysql"]
-	}
-	return tablet.MysqlPort
+	return netutil.JoinHostPort(tablet.MysqlHostname, tablet.MysqlPort)
 }
 
 // MySQLIP returns the MySQL server's IP by resolvign the host name.
 func MySQLIP(tablet *topodatapb.Tablet) (string, error) {
-	ipAddrs, err := net.LookupHost(MysqlHostname(tablet))
+	ipAddrs, err := net.LookupHost(tablet.MysqlHostname)
 	if err != nil {
 		return "", err
 	}

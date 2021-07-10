@@ -23,11 +23,14 @@ import (
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/vt/sqlparser"
+
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/vindexes"
@@ -209,25 +212,29 @@ func (ins *Insert) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.B
 
 // GetFields fetches the field info.
 func (ins *Insert) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: unreachable code for %q", ins.Query)
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] unreachable code for %q", ins.Query)
 }
 
 func (ins *Insert) execInsertUnsharded(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	insertID, err := ins.processGenerate(vcursor, bindVars)
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execInsertUnsharded")
+		return nil, err
 	}
 
 	rss, _, err := vcursor.ResolveDestinations(ins.Keyspace.Name, nil, []key.Destination{key.DestinationAllShards{}})
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execInsertUnsharded")
+		return nil, err
 	}
 	if len(rss) != 1 {
 		return nil, vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "Keyspace does not have exactly one shard: %v", rss)
 	}
+	err = allowOnlyMaster(rss...)
+	if err != nil {
+		return nil, err
+	}
 	result, err := execShard(vcursor, ins.Query, bindVars, rss[0], true, true /* canAutocommit */)
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execInsertUnsharded")
+		return nil, err
 	}
 
 	// If processGenerate generated new values, it supercedes
@@ -243,23 +250,43 @@ func (ins *Insert) execInsertUnsharded(vcursor VCursor, bindVars map[string]*que
 func (ins *Insert) execInsertSharded(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	insertID, err := ins.processGenerate(vcursor, bindVars)
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execInsertSharded")
+		return nil, err
 	}
 	rss, queries, err := ins.getInsertShardedRoute(vcursor, bindVars)
 	if err != nil {
-		return nil, vterrors.Wrap(err, "execInsertSharded")
+		return nil, err
 	}
 
 	autocommit := (len(rss) == 1 || ins.MultiShardAutocommit) && vcursor.AutocommitApproval()
+	err = allowOnlyMaster(rss...)
+	if err != nil {
+		return nil, err
+	}
 	result, errs := vcursor.ExecuteMultiShard(rss, queries, true /* rollbackOnError */, autocommit)
 	if errs != nil {
-		return nil, vterrors.Wrap(vterrors.Aggregate(errs), "execInsertSharded")
+		return nil, vterrors.Aggregate(errs)
 	}
 
 	if insertID != 0 {
 		result.InsertID = uint64(insertID)
 	}
 	return result, nil
+}
+
+// shouldGenerate determines if a sequence value should be generated for a given value
+func shouldGenerate(v sqltypes.Value) bool {
+	if v.IsNull() {
+		return true
+	}
+
+	// Unless the NO_AUTO_VALUE_ON_ZERO sql mode is active in mysql, it also
+	// treats 0 as a value that should generate a new sequence.
+	n, err := evalengine.ToUint64(v)
+	if err == nil && n == 0 {
+		return true
+	}
+
+	return false
 }
 
 // processGenerate generates new values using a sequence if necessary.
@@ -274,11 +301,11 @@ func (ins *Insert) processGenerate(vcursor VCursor, bindVars map[string]*querypb
 	// keep track of where they should be filled.
 	resolved, err := ins.Generate.Values.ResolveList(bindVars)
 	if err != nil {
-		return 0, vterrors.Wrap(err, "processGenerate")
+		return 0, err
 	}
 	count := int64(0)
 	for _, val := range resolved {
-		if val.IsNull() {
+		if shouldGenerate(val) {
 			count++
 		}
 	}
@@ -287,10 +314,10 @@ func (ins *Insert) processGenerate(vcursor VCursor, bindVars map[string]*querypb
 	if count != 0 {
 		rss, _, err := vcursor.ResolveDestinations(ins.Generate.Keyspace.Name, nil, []key.Destination{key.DestinationAnyShard{}})
 		if err != nil {
-			return 0, vterrors.Wrap(err, "processGenerate")
+			return 0, err
 		}
 		if len(rss) != 1 {
-			return 0, vterrors.Wrapf(err, "processGenerate len(rss)=%v", len(rss))
+			return 0, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "auto sequence generation can happen through single shard only, it is getting routed to %d shards", len(rss))
 		}
 		bindVars := map[string]*querypb.BindVariable{"n": sqltypes.Int64BindVariable(count)}
 		qr, err := vcursor.ExecuteStandalone(ins.Generate.Query, bindVars, rss[0])
@@ -299,7 +326,7 @@ func (ins *Insert) processGenerate(vcursor VCursor, bindVars map[string]*querypb
 		}
 		// If no rows are returned, it's an internal error, and the code
 		// must panic, which will be caught and reported.
-		insertID, err = sqltypes.ToInt64(qr.Rows[0][0])
+		insertID, err = evalengine.ToInt64(qr.Rows[0][0])
 		if err != nil {
 			return 0, err
 		}
@@ -308,7 +335,7 @@ func (ins *Insert) processGenerate(vcursor VCursor, bindVars map[string]*querypb
 	// Fill the holes where no value was supplied.
 	cur := insertID
 	for i, v := range resolved {
-		if v.IsNull() {
+		if shouldGenerate(v) {
 			bindVars[SeqVarName+strconv.Itoa(i)] = sqltypes.Int64BindVariable(cur)
 			cur++
 		} else {
@@ -336,23 +363,23 @@ func (ins *Insert) getInsertShardedRoute(vcursor VCursor, bindVars map[string]*q
 	rowCount := 0
 	for vIdx, vColValues := range ins.VindexValues {
 		if len(vColValues.Values) != len(ins.Table.ColumnVindexes[vIdx].Columns) {
-			return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: supplied vindex column values don't match vschema: %v %v", vColValues, ins.Table.ColumnVindexes[vIdx].Columns)
+			return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] supplied vindex column values don't match vschema: %v %v", vColValues, ins.Table.ColumnVindexes[vIdx].Columns)
 		}
 		for colIdx, colValues := range vColValues.Values {
 			rowsResolvedValues, err := colValues.ResolveList(bindVars)
 			if err != nil {
-				return nil, nil, vterrors.Wrap(err, "getInsertShardedRoute")
+				return nil, nil, err
 			}
 			// This is the first iteration: allocate for transpose.
 			if colIdx == 0 {
 				if len(rowsResolvedValues) == 0 {
-					return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: rowcount is zero for inserts: %v", rowsResolvedValues)
+					return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] rowcount is zero for inserts: %v", rowsResolvedValues)
 				}
 				if rowCount == 0 {
 					rowCount = len(rowsResolvedValues)
 				}
 				if rowCount != len(rowsResolvedValues) {
-					return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: uneven row values for inserts: %d %d", rowCount, len(rowsResolvedValues))
+					return nil, nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] uneven row values for inserts: %d %d", rowCount, len(rowsResolvedValues))
 				}
 				vindexRowsValues[vIdx] = make([][]sqltypes.Value, rowCount)
 			}
@@ -367,9 +394,12 @@ func (ins *Insert) getInsertShardedRoute(vcursor VCursor, bindVars map[string]*q
 	// keyspace ids. For regular inserts, a failure to find a route
 	// results in an error. For 'ignore' type inserts, the keyspace
 	// id is returned as nil, which is used later to drop the corresponding rows.
+	if len(vindexRowsValues) == 0 || len(ins.Table.ColumnVindexes) == 0 {
+		return nil, nil, vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.RequiresPrimaryKey, vterrors.PrimaryVindexNotSet, ins.Table.Name)
+	}
 	keyspaceIDs, err := ins.processPrimary(vcursor, vindexRowsValues[0], ins.Table.ColumnVindexes[0])
 	if err != nil {
-		return nil, nil, vterrors.Wrap(err, "getInsertShardedRoute")
+		return nil, nil, err
 	}
 
 	for vIdx := 1; vIdx < len(ins.Table.ColumnVindexes); vIdx++ {
@@ -381,7 +411,7 @@ func (ins *Insert) getInsertShardedRoute(vcursor VCursor, bindVars map[string]*q
 			err = ins.processUnowned(vcursor, vindexRowsValues[vIdx], colVindex, keyspaceIDs)
 		}
 		if err != nil {
-			return nil, nil, vterrors.Wrap(err, "getInsertShardedRoute")
+			return nil, nil, err
 		}
 	}
 
@@ -395,7 +425,8 @@ func (ins *Insert) getInsertShardedRoute(vcursor VCursor, bindVars map[string]*q
 			}
 			for colIdx, vindexKey := range rowColumnKeys {
 				col := colVindex.Columns[colIdx]
-				bindVars[insertVarName(col, rowNum)] = sqltypes.ValueBindVariable(vindexKey)
+				name := InsertVarName(col, rowNum)
+				bindVars[name] = sqltypes.ValueBindVariable(vindexKey)
 			}
 		}
 	}
@@ -421,7 +452,7 @@ func (ins *Insert) getInsertShardedRoute(vcursor VCursor, bindVars map[string]*q
 
 	rss, indexesPerRss, err := vcursor.ResolveDestinations(ins.Keyspace.Name, indexes, destinations)
 	if err != nil {
-		return nil, nil, vterrors.Wrap(err, "getInsertShardedRoute")
+		return nil, nil, err
 	}
 
 	queries := make([]*querypb.BoundQuery, len(rss))
@@ -512,9 +543,9 @@ func (ins *Insert) processOwned(vcursor VCursor, vindexColumnsKeys [][]sqltypes.
 
 // processUnowned either reverse maps or validates the values for an unowned column.
 func (ins *Insert) processUnowned(vcursor VCursor, vindexColumnsKeys [][]sqltypes.Value, colVindex *vindexes.ColumnVindex, ksids [][]byte) error {
-	var reverseIndexes []int
+	reverseIndexes := []int{}
 	var reverseKsids [][]byte
-	var verifyIndexes []int
+	verifyIndexes := []int{}
 	var verifyKeys [][]sqltypes.Value
 	var verifyKsids [][]byte
 
@@ -578,8 +609,10 @@ func (ins *Insert) processUnowned(vcursor VCursor, vindexColumnsKeys [][]sqltype
 	return nil
 }
 
-func insertVarName(col sqlparser.ColIdent, rowNum int) string {
-	return "_" + col.CompliantName() + strconv.Itoa(rowNum)
+//InsertVarName returns a name for the bind var for this column. This method is used by the planner and engine,
+//to make sure they both produce the same names
+func InsertVarName(col sqlparser.ColIdent, rowNum int) string {
+	return fmt.Sprintf("_%s_%d", col.CompliantName(), rowNum)
 }
 
 func (ins *Insert) description() PrimitiveDescription {

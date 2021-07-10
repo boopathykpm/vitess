@@ -115,6 +115,14 @@ message StreamTablesResponse {
   BinlogTransaction binlog_transaction = 1;
 }
 
+// CharsetConversion represent a conversion of text from one charset to another
+message CharsetConversion {
+  // FromCharset is the charset name from which we convert the text (e.g. latin1)
+  string from_charset = 1;
+  // ToCharset is the charset name to which we convert the text (e.g. utf8mb4)
+  string to_charset = 2;
+}
+
 // Rule represents one rule in a Filter.
 message Rule {
   // Match can be a table name or a regular expression.
@@ -138,6 +146,19 @@ message Rule {
   // to be excluded.
   // TODO(sougou): support this on vstreamer side also.
   string filter = 2;
+  // ConvertEnumToText: optional, list per enum column name, the list of textual values.
+  // When reading the binary log, all enum values are numeric. But sometimes it
+  // is useful/needed to know what the textual mapping are.
+  // Online DDL provides such use case.
+
+  // Example: key="color", value="'red','green','blue'"
+  map<string, string> convert_enum_to_text = 3;
+
+  // ConvertCharset: optional mapping, between column name and a CharsetConversion.
+  // This hints to vreplication that columns are encoded from/to non-trivial charsets
+  // The map is only populated when either "from" or "to" charset of a column are non-trivial
+  // trivial charsets are utf8 and ascii variants.
+  map<string, CharsetConversion> convert_charset = 4;
 }
 
 // Filter represents a list of ordered rules. The first
@@ -200,6 +221,10 @@ message BinlogSource {
   // StopAfterCopy specifies if vreplication should be stopped
   // after copying is done.
   bool stop_after_copy = 9;
+
+  // ExternalCluster is the name of the mounted cluster which has the source keyspace/db for this workflow
+  // it is of the type <cluster_type.cluster_name>
+  string external_cluster = 10;
 }
 
 // VEventType enumerates the event types. Many of these types
@@ -230,6 +255,9 @@ enum VEventType {
   // GTIDs.
   VGTID = 15;
   JOURNAL = 16;
+  VERSION = 17;
+  LASTPK = 18;
+  SAVEPOINT = 19;
 }
 
 // RowChange represents one row change.
@@ -262,6 +290,7 @@ message ShardGtid {
   string keyspace = 1;
   string shard = 2;
   string gtid = 3;
+  repeated TableLastPK table_p_ks = 4;
 }
 
 // A VGtid is a list of ShardGtids.
@@ -324,8 +353,8 @@ message VEvent {
   int64 timestamp = 2;
   // Gtid is set if the event type is GTID.
   string gtid = 3;
-  // Ddl is set if the event type is DDL.
-  string ddl = 4;
+  // Statement is set if the event type is DDL, DML or SAVEPOINT.
+  string statement = 4;
   // RowEvent is set if the event type is ROW.
   RowEvent row_event = 5;
   // FieldEvent is set if the event type is FIELD.
@@ -340,6 +369,18 @@ message VEvent {
   // CurrentTime specifies the current time when the message was sent.
   // This can be used to compenssate for clock skew.
   int64 current_time = 20;
+  // LastPK is the last PK for a table
+  LastPKEvent last_p_k_event = 21;
+}
+
+message MinimalTable {
+    string name = 1;
+    repeated query.Field fields = 2;
+    repeated int64 p_k_columns = 3;
+}
+
+message MinimalSchema {
+    repeated MinimalTable tables = 1;
 }
 
 // VStreamRequest is the payload for VStreamer
@@ -350,6 +391,7 @@ message VStreamRequest {
 
   string position = 4;
   Filter filter = 5;
+  repeated TableLastPK table_last_p_ks = 6;
 }
 
 // VStreamResponse is the response from VStreamer
@@ -376,7 +418,18 @@ message VStreamRowsResponse {
   query.Row lastpk = 5;
 }
 
+message LastPKEvent {
+  TableLastPK table_last_p_k = 1;
+  bool completed = 2;
+}
+
+message TableLastPK {
+  string table_name = 1;
+  query.QueryResult lastpk = 3;
+}
+
 // VStreamResultsRequest is the payload for VStreamResults
+// The ids match VStreamRows, in case we decide to merge the two.
 // The ids match VStreamRows, in case we decide to merge the two.
 message VStreamResultsRequest {
   vtrpc.CallerID effective_caller_id = 1;

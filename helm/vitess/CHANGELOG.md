@@ -1,3 +1,10 @@
+## 2.0.1-0 - 2020-04-16
+
+The charts now officially support Kubernetes 1.11 and newer.
+
+### Changes
+* The VitessTopoNode CRD is now created using the `apiextensions.k8s.io/v1beta1` API.
+
 ## 2.0.0-0 - 2020-04-03
 
 Vitess now supports using the Kubernetes API as a topology provider. This means that it is now easier than ever to run Vitess on Kubernetes! 
@@ -40,7 +47,7 @@ lagging replicas from being promoted to master and causing errant GTID problems.
 ## 1.0.4 - 2019-01-01
 
 ### Changes
-* Use the [Orchestrator API](https://github.com/github/orchestrator/blob/master/docs/using-the-web-api.md)
+* Use the [Orchestrator API](https://github.com/openark/orchestrator/blob/master/docs/using-the-web-api.md)
 to call `begin-downtime` before running `PlannedReparentShard` in the `preStopHook`, to make sure that Orchestrator
 doesn't try to run an external failover while Vitess is reparenting. When it is complete, it calls `end-downtime`.
 Also call `forget` on the instance after calling `vtctlclient DeleteTablet`. It will be rediscovered if/when

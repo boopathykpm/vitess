@@ -18,16 +18,18 @@ package vtgate
 
 import (
 	"net"
-	"reflect"
 	"strconv"
 	"testing"
+
+	"vitess.io/vitess/go/test/utils"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
 
@@ -48,12 +50,11 @@ func TestMySQLProtocolExecute(t *testing.T) {
 
 	qr, err := c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
 	require.NoError(t, err)
-	if !reflect.DeepEqual(sandboxconn.SingleRowResult, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, sandboxconn.SingleRowResult, qr, "mismatch in rows")
 
 	options := &querypb.ExecuteOptions{
 		IncludedFields: querypb.ExecuteOptions_ALL,
+		Workload:       querypb.ExecuteOptions_OLTP,
 	}
 	if !proto.Equal(sbc.Options[0], options) {
 		t.Errorf("got ExecuteOptions \n%+v, want \n%+v", sbc.Options[0], options)
@@ -76,9 +77,7 @@ func TestMySQLProtocolStreamExecute(t *testing.T) {
 
 	qr, err := c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
 	require.NoError(t, err)
-	if !reflect.DeepEqual(sandboxconn.SingleRowResult, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, sandboxconn.SingleRowResult, qr, "mismatch in rows")
 
 	options := &querypb.ExecuteOptions{
 		IncludedFields: querypb.ExecuteOptions_ALL,
@@ -102,7 +101,7 @@ func TestMySQLProtocolExecuteUseStatement(t *testing.T) {
 
 	qr, err := c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
 	require.NoError(t, err)
-	require.Equal(t, sandboxconn.SingleRowResult, qr)
+	utils.MustMatch(t, sandboxconn.SingleRowResult, qr)
 
 	qr, err = c.ExecuteFetch("show vitess_target", 1, false)
 	require.NoError(t, err)
@@ -113,12 +112,12 @@ func TestMySQLProtocolExecuteUseStatement(t *testing.T) {
 
 	qr, err = c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
 	require.NoError(t, err)
-	assert.Equal(t, sandboxconn.SingleRowResult, qr)
+	utils.MustMatch(t, sandboxconn.SingleRowResult, qr)
 
 	// No such keyspace this will fail
 	_, err = c.ExecuteFetch("use InvalidKeyspace", 0, false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid keyspace provided: InvalidKeyspace")
+	assert.Contains(t, err.Error(), "unknown database 'InvalidKeyspace' (errno 1049) (sqlstate 42000)")
 
 	// That doesn't reset the vitess_target
 	qr, err = c.ExecuteFetch("show vitess_target", 1, false)
@@ -131,22 +130,12 @@ func TestMySQLProtocolExecuteUseStatement(t *testing.T) {
 	// No replica tablets, this should also fail
 	_, err = c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no valid tablet")
+	assert.Contains(t, err.Error(), `no healthy tablet available for 'keyspace:"TestUnsharded" shard:"0" tablet_type:REPLICA`)
 }
 
 func TestMysqlProtocolInvalidDB(t *testing.T) {
-	c, err := mysqlConnect(&mysql.ConnParams{DbName: "invalidDB"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	_, err = c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
-	c.Close()
-	want := "vtgate: : keyspace invalidDB not found in vschema (errno 1105) (sqlstate HY000) during query: select id from t1"
-	if err == nil || err.Error() != want {
-		t.Errorf("exec with db:\n%v, want\n%s", err, want)
-	}
+	_, err := mysqlConnect(&mysql.ConnParams{DbName: "invalidDB"})
+	require.EqualError(t, err, "unknown database 'invalidDB' (errno 1049) (sqlstate 42000)")
 }
 
 func TestMySQLProtocolClientFoundRows(t *testing.T) {
@@ -162,14 +151,14 @@ func TestMySQLProtocolClientFoundRows(t *testing.T) {
 
 	qr, err := c.ExecuteFetch("select id from t1", 10, true /* wantfields */)
 	require.NoError(t, err)
-	if !reflect.DeepEqual(sandboxconn.SingleRowResult, qr) {
-		t.Errorf("want \n%+v, got \n%+v", sandboxconn.SingleRowResult, qr)
-	}
+	utils.MustMatch(t, sandboxconn.SingleRowResult, qr)
 
 	options := &querypb.ExecuteOptions{
 		IncludedFields:  querypb.ExecuteOptions_ALL,
 		ClientFoundRows: true,
+		Workload:        querypb.ExecuteOptions_OLTP,
 	}
+
 	if !proto.Equal(sbc.Options[0], options) {
 		t.Errorf("got ExecuteOptions \n%+v, want \n%+v", sbc.Options[0], options)
 	}

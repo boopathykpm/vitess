@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
@@ -88,7 +88,7 @@ func TestUpdateVSchema(t *testing.T) {
 		}},
 	}
 	// Stream should terminate immediately due to canceled context.
-	_ = engine.Stream(ctx, "current", filter, func(_ []*binlogdatapb.VEvent) error {
+	_ = engine.Stream(ctx, "current", nil, filter, func(_ []*binlogdatapb.VEvent) error {
 		return nil
 	})
 

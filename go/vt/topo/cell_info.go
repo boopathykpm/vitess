@@ -17,10 +17,13 @@ limitations under the License.
 package topo
 
 import (
+	"context"
 	"path"
+	"strings"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -168,4 +171,57 @@ func (ts *Server) GetKnownCells(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return DirEntriesToStringArray(entries), nil
+}
+
+// ExpandCells takes a comma-separated list of cells and returns an array of cell names
+// Aliases are expanded and an empty string returns all cells
+func (ts *Server) ExpandCells(ctx context.Context, cells string) ([]string, error) {
+	var (
+		err         error
+		inputCells  []string
+		outputCells = sets.NewString() // Use a set to dedupe if the input cells list includes an alias and a cell in that alias.
+	)
+
+	if cells == "" {
+		inputCells, err = ts.GetCellInfoNames(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		inputCells = strings.Split(cells, ",")
+	}
+
+	expandCell := func(ctx context.Context, cell string) error {
+		shortCtx, cancel := context.WithTimeout(ctx, *RemoteOperationTimeout)
+		defer cancel()
+
+		_, err := ts.GetCellInfo(shortCtx, cell, false /* strongRead */)
+		if err != nil {
+			// Not a valid cell name. Check whether it is an alias.
+			shortCtx, cancel := context.WithTimeout(ctx, *RemoteOperationTimeout)
+			defer cancel()
+
+			alias, err2 := ts.GetCellsAlias(shortCtx, cell, false /* strongRead */)
+			if err2 != nil {
+				return err // return the original err to indicate the cell does not exist
+			}
+
+			// Expand the alias cells list into the final set.
+			outputCells.Insert(alias.Cells...)
+			return nil
+		}
+
+		// Valid cell.
+		outputCells.Insert(cell)
+		return nil
+	}
+
+	for _, cell := range inputCells {
+		cell2 := strings.TrimSpace(cell)
+		if err := expandCell(ctx, cell2); err != nil {
+			return nil, err
+		}
+	}
+
+	return outputCells.List(), nil
 }

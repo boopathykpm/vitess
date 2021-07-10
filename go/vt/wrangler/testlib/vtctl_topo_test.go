@@ -23,9 +23,10 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -71,9 +72,9 @@ func TestVtctlTopoCommands(t *testing.T) {
 
 	// Test TopoCat.
 	testVtctlTopoCommand(t, vp, []string{"TopoCat", "-long", "-decode_proto", "/keyspaces/*/Keyspace"}, `path=/keyspaces/ks1/Keyspace version=V
-sharding_column_name: "col1"
+sharding_column_name:"col1"
 path=/keyspaces/ks2/Keyspace version=V
-sharding_column_name: "col2"
+sharding_column_name:"col2"
 `)
 
 	// Test TopoCp from topo to disk.

@@ -17,12 +17,16 @@ limitations under the License.
 package messager
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
+	"context"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -253,17 +257,55 @@ func newMessageManager(tsv TabletService, vs VStreamer, table *schema.Table, pos
 	mm.purgeQuery = sqlparser.BuildParsedQuery(
 		"delete from %v where time_acked < %a limit 500", mm.name, ":time_acked")
 
-	// if a maxBackoff is set, incorporate it into the update statement
-	if mm.maxBackoff > 0 {
-		mm.postponeQuery = sqlparser.BuildParsedQuery(
-			"update %v set time_next = %a+if(%a<<ifnull(epoch, 0) > %a, %a, %a<<ifnull(epoch, 0)), epoch = ifnull(epoch, 0)+1 where id in %a and time_acked is null",
-			mm.name, ":time_now", ":min_backoff", ":max_backoff", ":max_backoff", ":min_backoff", "::ids")
-	} else {
-		mm.postponeQuery = sqlparser.BuildParsedQuery(
-			"update %v set time_next = %a+(%a<<ifnull(epoch, 0)), epoch = ifnull(epoch, 0)+1 where id in %a and time_acked is null",
-			mm.name, ":time_now", ":min_backoff", "::ids")
-	}
+	mm.postponeQuery = buildPostponeQuery(mm.name, mm.minBackoff, mm.maxBackoff)
+
 	return mm
+}
+
+func buildPostponeQuery(name sqlparser.TableIdent, minBackoff, maxBackoff time.Duration) *sqlparser.ParsedQuery {
+	var args []interface{}
+
+	// since messages are immediately postponed upon sending, we need to add exponential backoff on top
+	// of the ackWaitTime, otherwise messages will be resent too quickly.
+	buf := bytes.NewBufferString("update %v set time_next = %a + %a + ")
+	args = append(args, name, ":time_now", ":wait_time")
+
+	// have backoff be +/- 33%, whenever this is injected, append (:min_backoff, :jitter)
+	jitteredBackoff := "FLOOR((%a<<ifnull(epoch, 0)) * %a)"
+
+	//
+	// if the jittered backoff is less than min_backoff, just set it to :min_backoff
+	//
+	buf.WriteString(fmt.Sprintf("IF(%s < %%a, %%a, ", jitteredBackoff))
+	// jitteredBackoff < :min_backoff
+	args = append(args, ":min_backoff", ":jitter", ":min_backoff")
+	// if it is less, then use :min_backoff
+	args = append(args, ":min_backoff")
+
+	// now we are setting the false case on the above IF statement
+	if maxBackoff == 0 {
+		// if there is no max_backoff, just use jitteredBackoff
+		buf.WriteString(jitteredBackoff)
+		args = append(args, ":min_backoff", ":jitter")
+	} else {
+		// make sure that it doesn't exceed max_backoff
+		buf.WriteString(fmt.Sprintf("IF(%s > %%a, %%a, %s)", jitteredBackoff, jitteredBackoff))
+		// jitteredBackoff > :max_backoff
+		args = append(args, ":min_backoff", ":jitter", ":max_backoff")
+		// if it is greater, then use :max_backoff
+		args = append(args, ":max_backoff")
+		// otherwise just use jitteredBackoff
+		args = append(args, ":min_backoff", ":jitter")
+	}
+
+	// close the if statement
+	buf.WriteString(")")
+
+	// now that we've identified time_next, finish the statement
+	buf.WriteString(", epoch = ifnull(epoch, 0)+1 where id in %a and time_acked is null")
+	args = append(args, "::ids")
+
+	return sqlparser.BuildParsedQuery(buf.String(), args...)
 }
 
 // buildSelectColumnList is a convenience function that
@@ -607,7 +649,7 @@ func (mm *messageManager) runOneVStream(ctx context.Context) error {
 	var curPos string
 	var fields []*querypb.Field
 
-	err := mm.vs.Stream(ctx, "current", mm.vsFilter, func(events []*binlogdatapb.VEvent) error {
+	err := mm.vs.Stream(ctx, "current", nil, mm.vsFilter, func(events []*binlogdatapb.VEvent) error {
 		mm.streamMu.Lock()
 		defer mm.streamMu.Unlock()
 
@@ -807,7 +849,9 @@ func (mm *messageManager) GeneratePostponeQuery(ids []string) (string, map[strin
 
 	bvs := map[string]*querypb.BindVariable{
 		"time_now":    sqltypes.Int64BindVariable(time.Now().UnixNano()),
+		"wait_time":   sqltypes.Int64BindVariable(int64(mm.ackWaitTime)),
 		"min_backoff": sqltypes.Int64BindVariable(int64(mm.minBackoff)),
+		"jitter":      sqltypes.Float64BindVariable(.666666 + rand.Float64()*.666666),
 		"ids":         idbvs,
 	}
 
@@ -829,28 +873,28 @@ func (mm *messageManager) GeneratePurgeQuery(timeCutoff int64) (string, map[stri
 func BuildMessageRow(row []sqltypes.Value) (*MessageRow, error) {
 	mr := &MessageRow{Row: row[4:]}
 	if !row[0].IsNull() {
-		v, err := sqltypes.ToInt64(row[0])
+		v, err := evalengine.ToInt64(row[0])
 		if err != nil {
 			return nil, err
 		}
 		mr.Priority = v
 	}
 	if !row[1].IsNull() {
-		v, err := sqltypes.ToInt64(row[0])
+		v, err := evalengine.ToInt64(row[1])
 		if err != nil {
 			return nil, err
 		}
 		mr.TimeNext = v
 	}
 	if !row[2].IsNull() {
-		v, err := sqltypes.ToInt64(row[1])
+		v, err := evalengine.ToInt64(row[2])
 		if err != nil {
 			return nil, err
 		}
 		mr.Epoch = v
 	}
 	if !row[3].IsNull() {
-		v, err := sqltypes.ToInt64(row[2])
+		v, err := evalengine.ToInt64(row[3])
 		if err != nil {
 			return nil, err
 		}

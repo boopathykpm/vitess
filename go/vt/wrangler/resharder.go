@@ -17,13 +17,18 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/vtctl/workflow"
+
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/concurrency"
@@ -47,6 +52,9 @@ type resharder struct {
 	targetMasters map[string]*topo.TabletInfo
 	vschema       *vschemapb.Keyspace
 	refStreams    map[string]*refStream
+	cell          string //single cell or cellsAlias or comma-separated list of cells/cellsAliases
+	tabletTypes   string
+	stopAfterCopy bool
 }
 
 type refStream struct {
@@ -57,15 +65,23 @@ type refStream struct {
 }
 
 // Reshard initiates a resharding workflow.
-func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sources, targets []string, skipSchemaCopy bool) error {
+func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sources, targets []string,
+	skipSchemaCopy bool, cell, tabletTypes string, autoStart, stopAfterCopy bool) error {
 	if err := wr.validateNewWorkflow(ctx, keyspace, workflow); err != nil {
 		return err
 	}
+	if err := wr.ts.ValidateSrvKeyspace(ctx, keyspace, cell); err != nil {
+		err2 := vterrors.Wrapf(err, "SrvKeyspace for keyspace %s is corrupt in cell %s", keyspace, cell)
+		log.Errorf("%w", err2)
+		return err2
+	}
 
-	rs, err := wr.buildResharder(ctx, keyspace, workflow, sources, targets)
+	rs, err := wr.buildResharder(ctx, keyspace, workflow, sources, targets, cell, tabletTypes)
 	if err != nil {
 		return vterrors.Wrap(err, "buildResharder")
 	}
+
+	rs.stopAfterCopy = stopAfterCopy
 	if !skipSchemaCopy {
 		if err := rs.copySchema(ctx); err != nil {
 			return vterrors.Wrap(err, "copySchema")
@@ -74,19 +90,26 @@ func (wr *Wrangler) Reshard(ctx context.Context, keyspace, workflow string, sour
 	if err := rs.createStreams(ctx); err != nil {
 		return vterrors.Wrap(err, "createStreams")
 	}
-	if err := rs.startStreams(ctx); err != nil {
-		return vterrors.Wrap(err, "startStream")
+
+	if autoStart {
+		if err := rs.startStreams(ctx); err != nil {
+			return vterrors.Wrap(err, "startStreams")
+		}
+	} else {
+		wr.Logger().Infof("Streams will not be started since -auto_start is set to false")
 	}
 	return nil
 }
 
-func (wr *Wrangler) buildResharder(ctx context.Context, keyspace, workflow string, sources, targets []string) (*resharder, error) {
+func (wr *Wrangler) buildResharder(ctx context.Context, keyspace, workflow string, sources, targets []string, cell, tabletTypes string) (*resharder, error) {
 	rs := &resharder{
 		wr:            wr,
 		keyspace:      keyspace,
 		workflow:      workflow,
 		sourceMasters: make(map[string]*topo.TabletInfo),
 		targetMasters: make(map[string]*topo.TabletInfo),
+		cell:          cell,
+		tabletTypes:   tabletTypes,
 	}
 	for _, shard := range sources {
 		si, err := wr.ts.GetShard(ctx, keyspace, shard)
@@ -158,7 +181,7 @@ func (rs *resharder) readRefStreams(ctx context.Context) error {
 	err := rs.forAll(rs.sourceShards, func(source *topo.ShardInfo) error {
 		sourceMaster := rs.sourceMasters[source.ShardName()]
 
-		query := fmt.Sprintf("select workflow, source, cell, tablet_types from _vt.vreplication where db_name=%s", encodeString(sourceMaster.DbName()))
+		query := fmt.Sprintf("select workflow, source, cell, tablet_types from _vt.vreplication where db_name=%s and message != 'FROZEN'", encodeString(sourceMaster.DbName()))
 		p3qr, err := rs.wr.tmc.VReplicationExec(ctx, sourceMaster.Tablet, query)
 		if err != nil {
 			return vterrors.Wrapf(err, "VReplicationExec(%v, %s)", sourceMaster.Tablet, query)
@@ -181,13 +204,14 @@ func (rs *resharder) readRefStreams(ctx context.Context) error {
 			}
 		}
 		for _, row := range qr.Rows {
+
 			workflow := row[0].ToString()
 			if workflow == "" {
 				return fmt.Errorf("VReplication streams must have named workflows for migration: shard: %s:%s", source.Keyspace(), source.ShardName())
 			}
 			var bls binlogdatapb.BinlogSource
-			if err := proto.UnmarshalText(row[1].ToString(), &bls); err != nil {
-				return vterrors.Wrapf(err, "UnmarshalText: %v", row)
+			if err := prototext.Unmarshal(row[1].ToBytes(), &bls); err != nil {
+				return vterrors.Wrapf(err, "prototext.Unmarshal: %v", row)
 			}
 			isReference, err := rs.blsIsReference(&bls)
 			if err != nil {
@@ -222,39 +246,40 @@ func (rs *resharder) readRefStreams(ctx context.Context) error {
 // blsIsReference is partially copied from streamMigrater.templatize.
 // It reuses the constants from that function also.
 func (rs *resharder) blsIsReference(bls *binlogdatapb.BinlogSource) (bool, error) {
-	streamType := unknown
+	streamType := workflow.StreamTypeUnknown
 	for _, rule := range bls.Filter.Rules {
 		typ, err := rs.identifyRuleType(rule)
 		if err != nil {
 			return false, err
 		}
+
 		switch typ {
-		case sharded:
-			if streamType == reference {
+		case workflow.StreamTypeSharded:
+			if streamType == workflow.StreamTypeReference {
 				return false, fmt.Errorf("cannot reshard streams with a mix of reference and sharded tables: %v", bls)
 			}
-			streamType = sharded
-		case reference:
-			if streamType == sharded {
+			streamType = workflow.StreamTypeSharded
+		case workflow.StreamTypeReference:
+			if streamType == workflow.StreamTypeSharded {
 				return false, fmt.Errorf("cannot reshard streams with a mix of reference and sharded tables: %v", bls)
 			}
-			streamType = reference
+			streamType = workflow.StreamTypeReference
 		}
 	}
-	return streamType == reference, nil
+	return streamType == workflow.StreamTypeReference, nil
 }
 
-func (rs *resharder) identifyRuleType(rule *binlogdatapb.Rule) (int, error) {
+func (rs *resharder) identifyRuleType(rule *binlogdatapb.Rule) (workflow.StreamType, error) {
 	vtable, ok := rs.vschema.Tables[rule.Match]
 	if !ok {
 		return 0, fmt.Errorf("table %v not found in vschema", rule.Match)
 	}
 	if vtable.Type == vindexes.TypeReference {
-		return reference, nil
+		return workflow.StreamTypeReference, nil
 	}
 	// In this case, 'sharded' means that it's not a reference
 	// table. We don't care about any other subtleties.
-	return sharded, nil
+	return workflow.StreamTypeSharded, nil
 }
 
 func (rs *resharder) copySchema(ctx context.Context) error {
@@ -294,11 +319,12 @@ func (rs *resharder) createStreams(ctx context.Context) error {
 				}),
 			}
 			bls := &binlogdatapb.BinlogSource{
-				Keyspace: rs.keyspace,
-				Shard:    source.ShardName(),
-				Filter:   filter,
+				Keyspace:      rs.keyspace,
+				Shard:         source.ShardName(),
+				Filter:        filter,
+				StopAfterCopy: rs.stopAfterCopy,
 			}
-			ig.AddRow(rs.workflow, bls, "", "", "")
+			ig.AddRow(rs.workflow, bls, "", rs.cell, rs.tabletTypes)
 		}
 
 		for _, rstream := range rs.refStreams {

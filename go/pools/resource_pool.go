@@ -24,11 +24,14 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/timer"
 	"vitess.io/vitess/go/trace"
+	"vitess.io/vitess/go/vt/vterrors"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 var (
@@ -36,16 +39,16 @@ var (
 	ErrClosed = errors.New("resource pool is closed")
 
 	// ErrTimeout is returned if a resource get times out.
-	ErrTimeout = errors.New("resource pool timed out")
+	ErrTimeout = vterrors.New(vtrpcpb.Code_DEADLINE_EXCEEDED, "resource pool timed out")
 
 	// ErrCtxTimeout is returned if a ctx is already expired by the time the resource pool is used
-	ErrCtxTimeout = errors.New("resource pool context already expired")
+	ErrCtxTimeout = vterrors.New(vtrpcpb.Code_DEADLINE_EXCEEDED, "resource pool context already expired")
 
 	prefillTimeout = 30 * time.Second
 )
 
 // Factory is a function that can be used to create a resource.
-type Factory func() (Resource, error)
+type Factory func(context.Context) (Resource, error)
 
 // Resource defines the interface that every resource must provide.
 // Thread synchronization between Close() and IsClosed()
@@ -228,7 +231,7 @@ func (rp *ResourcePool) get(ctx context.Context) (resource Resource, err error) 
 	// Unwrap
 	if wrapper.resource == nil {
 		span, _ := trace.NewSpan(ctx, "ResourcePool.factory")
-		wrapper.resource, err = rp.factory()
+		wrapper.resource, err = rp.factory(ctx)
 		span.Finish()
 		if err != nil {
 			rp.resources <- resourceWrapper{}
@@ -267,7 +270,7 @@ func (rp *ResourcePool) Put(resource Resource) {
 }
 
 func (rp *ResourcePool) reopenResource(wrapper *resourceWrapper) {
-	if r, err := rp.factory(); err == nil {
+	if r, err := rp.factory(context.TODO()); err == nil {
 		wrapper.resource = r
 		wrapper.timeUsed = time.Now()
 	} else {
